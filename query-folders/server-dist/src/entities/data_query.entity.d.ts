@@ -1,0 +1,30 @@
+import { BaseEntity } from 'typeorm';
+import { App } from './app.entity';
+import { AppVersion } from './app_version.entity';
+import { DataSource } from './data_source.entity';
+import { Plugin } from './plugin.entity';
+import { QueryPermission } from './query_permissions.entity';
+import { QueryFolder } from './query_folder.entity';
+export declare class DataQuery extends BaseEntity {
+    id: string;
+    name: string;
+    options: any;
+    dataSourceId: string;
+    appVersionId: string;
+    queryFolderId: string;
+    folderPosition: number;
+    createdAt: Date;
+    updatedAt: Date;
+    dataSource: DataSource;
+    appVersion: AppVersion;
+    queryFolder: QueryFolder;
+    plugins: Plugin[];
+    plugin: Plugin;
+    kind: string;
+    apps: App[];
+    app: App;
+    permissions: QueryPermission[];
+    updatePlugin(): void;
+    updateKind(): void;
+    updateApp(): void;
+}

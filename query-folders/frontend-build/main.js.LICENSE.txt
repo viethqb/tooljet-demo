@@ -1,0 +1,31 @@
+//! NeedToFix
+
+//! Re render the component when the componentName changes as the initialValue is not updated
+
+//! Revisit this
+
+//! TODO get this using get() when migrated into slice
+
+//! TODO revisit this
+
+//! This is a hack to make sure the event is fired after exposed values are updated
+
+//! dont resolve if code starts with "queries." and ends with "run()"
+
+//! if resolvecode default value should be the value itself not empty string ... Ask KAVIN
+
+//! we need default value in store so that query can be resolved if referenced from other entity
+
+//!DON'T REMOVE environmentId WHILE RESOLVING CONFLICTS !!!
+
+//!Note: Do not delete this regex, it is used to check if the content includes a template literal
+
+//!TODO clear all queued tasks
+
+//!TODO push to debugger
+
+//!TODO use the updated new resolver
+
+//!check
+
+//!state=currentstate => The state passed down as an argument retains the previous state.
