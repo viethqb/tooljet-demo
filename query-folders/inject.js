@@ -293,19 +293,16 @@
     const tree = buildFolderHierarchy();
     const totalQueries = document.querySelectorAll('.query-list .query-row').length;
 
+    // Build HTML without inline handlers
     let html = '';
 
-    // "All Queries" item
     html += `
-      <div class="qf-folder-item qf-all-queries ${state.activeFolderId === null ? 'active' : ''}"
-           data-folder-id=""
-           onclick="window.__qf.setActiveFolder(null)">
+      <div class="qf-folder-item qf-all-queries ${state.activeFolderId === null ? 'active' : ''}" data-folder-id="" data-action="select">
         <span class="qf-folder-icon">${ICONS.list}</span>
         <span class="qf-folder-name">All Queries</span>
         <span class="qf-folder-count">${totalQueries}</span>
       </div>`;
 
-    // Render folder items
     function renderFolder(folder) {
       const isCollapsed = state.collapsedFolders.has(folder.id);
       const isActive = state.activeFolderId === folder.id;
@@ -314,30 +311,18 @@
       const indent = folder.depth * 16;
 
       html += `
-        <div class="qf-folder-item ${isActive ? 'active' : ''}"
-             data-folder-id="${folder.id}"
-             ondragover="window.__qf.onDragOver(event)"
-             ondragleave="window.__qf.onDragLeave(event)"
-             ondrop="window.__qf.onDrop(event, '${folder.id}')"
-             onclick="window.__qf.setActiveFolder('${folder.id}')"
-             oncontextmenu="window.__qf.showContextMenu(event, '${folder.id}')">
+        <div class="qf-folder-item ${isActive ? 'active' : ''}" data-folder-id="${folder.id}" data-action="select" data-drop-target="true">
           <span class="qf-folder-item-indent" style="width:${indent}px"></span>
-          ${
-            hasChildren
-              ? `<span class="qf-folder-toggle ${isCollapsed ? 'collapsed' : ''}"
-                   onclick="event.stopPropagation(); window.__qf.toggleFolder('${folder.id}')">${ICONS.chevron}</span>`
-              : '<span style="width:16px;display:inline-block;flex-shrink:0"></span>'
+          ${hasChildren
+            ? `<span class="qf-folder-toggle ${isCollapsed ? 'collapsed' : ''}" data-action="toggle" data-folder-id="${folder.id}">${ICONS.chevron}</span>`
+            : '<span style="width:16px;display:inline-block;flex-shrink:0"></span>'
           }
           <span class="qf-folder-icon">${isActive || !isCollapsed ? ICONS.folderOpen : ICONS.folder}</span>
           <span class="qf-folder-name">${escapeHtml(folder.name)}</span>
           <span class="qf-folder-count">${queryCount}</span>
           <span class="qf-folder-actions">
-            <button class="qf-btn-icon" onclick="event.stopPropagation(); window.__qf.showRenameModal('${folder.id}')" title="Rename">
-              ${ICONS.edit}
-            </button>
-            <button class="qf-btn-icon" onclick="event.stopPropagation(); window.__qf.showDeleteConfirm('${folder.id}')" title="Delete">
-              ${ICONS.trash}
-            </button>
+            <button class="qf-btn-icon" data-action="rename" data-folder-id="${folder.id}" title="Rename">${ICONS.edit}</button>
+            <button class="qf-btn-icon" data-action="delete" data-folder-id="${folder.id}" title="Delete">${ICONS.trash}</button>
           </span>
         </div>`;
 
@@ -347,8 +332,47 @@
     }
 
     tree.forEach(renderFolder);
-
     container.innerHTML = html;
+
+    // Attach event listeners via delegation
+    container.addEventListener('click', (e) => {
+      const actionEl = e.target.closest('[data-action]');
+      if (!actionEl) return;
+      const action = actionEl.dataset.action;
+      const folderId = actionEl.dataset.folderId;
+
+      if (action === 'toggle') {
+        e.stopPropagation();
+        window.__qf.toggleFolder(folderId);
+      } else if (action === 'rename') {
+        e.stopPropagation();
+        window.__qf.showRenameModal(folderId);
+      } else if (action === 'delete') {
+        e.stopPropagation();
+        window.__qf.showDeleteConfirm(folderId);
+      } else if (action === 'select') {
+        window.__qf.setActiveFolder(folderId || null);
+      }
+    });
+
+    container.addEventListener('contextmenu', (e) => {
+      const folderItem = e.target.closest('.qf-folder-item[data-folder-id]');
+      if (folderItem && folderItem.dataset.folderId) {
+        window.__qf.showContextMenu(e, folderItem.dataset.folderId);
+      }
+    });
+
+    // Drag-and-drop on folder items
+    container.querySelectorAll('[data-drop-target]').forEach((el) => {
+      el.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; el.classList.add('drop-target'); });
+      el.addEventListener('dragleave', () => { el.classList.remove('drop-target'); });
+      el.addEventListener('drop', (e) => {
+        e.preventDefault();
+        el.classList.remove('drop-target');
+        const queryId = e.dataTransfer.getData('text/plain') || state.dragQueryId;
+        if (queryId) moveQueryToFolder(queryId, el.dataset.folderId);
+      });
+    });
   }
 
   // ===================== FOLDER FILTERING =====================
@@ -585,39 +609,41 @@
     const overlay = document.createElement('div');
     overlay.className = 'qf-modal-overlay';
     overlay.id = 'qf-modal-overlay';
-    overlay.onclick = (e) => {
+    overlay.addEventListener('click', (e) => {
       if (e.target === overlay) closeModal();
-    };
+    });
 
     const buttonsHtml = buttons
-      .map((btn) => {
-        if (btn.action === 'close') {
-          return `<button class="${btn.class}" onclick="window.__qf.closeModal()">${btn.text}</button>`;
-        }
-        return `<button class="${btn.class}" id="qf-modal-action-btn">${btn.text}</button>`;
-      })
+      .map((btn, i) => `<button class="${btn.class}" data-btn-idx="${i}">${btn.text}</button>`)
       .join('');
 
     overlay.innerHTML = `
-      <div class="qf-modal" onclick="event.stopPropagation()">
+      <div class="qf-modal">
         <div class="qf-modal-header">
           <h3 class="qf-modal-title">${title}</h3>
-          <button class="qf-modal-close" onclick="window.__qf.closeModal()">${ICONS.close}</button>
+          <button class="qf-modal-close" data-btn-close="true">${ICONS.close}</button>
         </div>
         <div class="qf-modal-body">${bodyHtml}</div>
         <div class="qf-modal-footer">${buttonsHtml}</div>
       </div>`;
 
-    document.body.appendChild(overlay);
+    // Stop propagation on modal itself
+    overlay.querySelector('.qf-modal').addEventListener('click', (e) => e.stopPropagation());
 
-    // Bind action button
-    const actionBtn = document.getElementById('qf-modal-action-btn');
-    if (actionBtn) {
-      const actionHandler = buttons.find((b) => b.action !== 'close');
-      if (actionHandler) {
-        actionBtn.addEventListener('click', actionHandler.action);
-      }
-    }
+    // Close button
+    overlay.querySelector('[data-btn-close]').addEventListener('click', closeModal);
+
+    // Footer buttons
+    overlay.querySelectorAll('[data-btn-idx]').forEach((el) => {
+      const idx = parseInt(el.dataset.btnIdx);
+      const btn = buttons[idx];
+      el.addEventListener('click', () => {
+        if (btn.action === 'close') closeModal();
+        else if (typeof btn.action === 'function') btn.action();
+      });
+    });
+
+    document.body.appendChild(overlay);
   }
 
   function closeModal() {
@@ -638,29 +664,21 @@
     menu.style.top = `${e.clientY}px`;
 
     menu.innerHTML = `
-      <button class="qf-context-menu-item" onclick="window.__qf.showRenameModal('${folderId}'); window.__qf.closeContextMenu()">
-        ${ICONS.edit} Rename
-      </button>
-      <button class="qf-context-menu-item" onclick="window.__qf.showCreateFolderModal('${folderId}'); window.__qf.closeContextMenu()">
-        ${ICONS.subfolder} Create Subfolder
-      </button>
+      <button class="qf-context-menu-item" data-ctx="rename">${ICONS.edit} Rename</button>
+      <button class="qf-context-menu-item" data-ctx="subfolder">${ICONS.subfolder} Create Subfolder</button>
       <div class="qf-context-menu-divider"></div>
-      <button class="qf-context-menu-item danger" onclick="window.__qf.showDeleteConfirm('${folderId}'); window.__qf.closeContextMenu()">
-        ${ICONS.trash} Delete
-      </button>`;
+      <button class="qf-context-menu-item danger" data-ctx="delete">${ICONS.trash} Delete</button>`;
+
+    menu.querySelector('[data-ctx="rename"]').addEventListener('click', () => { showRenameModal(folderId); closeContextMenu(); });
+    menu.querySelector('[data-ctx="subfolder"]').addEventListener('click', () => { showCreateFolderModal(folderId); closeContextMenu(); });
+    menu.querySelector('[data-ctx="delete"]').addEventListener('click', () => { showDeleteConfirm(folderId); closeContextMenu(); });
 
     document.body.appendChild(menu);
 
-    // Adjust position if off-screen
     const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) {
-      menu.style.left = `${window.innerWidth - rect.width - 8}px`;
-    }
-    if (rect.bottom > window.innerHeight) {
-      menu.style.top = `${window.innerHeight - rect.height - 8}px`;
-    }
+    if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+    if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
 
-    // Close on click outside
     setTimeout(() => {
       document.addEventListener('click', closeContextMenu, { once: true });
     }, 0);
@@ -741,10 +759,11 @@
     folderHeader.innerHTML = `
       <span class="qf-folder-header-title">Folders</span>
       <span class="qf-folder-header-actions">
-        <button class="qf-btn-icon" onclick="window.__qf.showCreateFolderModal()" title="Create folder">
+        <button class="qf-btn-icon" id="qf-create-folder-btn" title="Create folder">
           ${ICONS.plus}
         </button>
       </span>`;
+    folderHeader.querySelector('#qf-create-folder-btn').addEventListener('click', () => showCreateFolderModal());
 
     const folderTree = document.createElement('div');
     folderTree.className = 'qf-folder-tree';
