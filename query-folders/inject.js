@@ -727,16 +727,15 @@
   }
 
   // ===================== DOM INJECTION =====================
+  // Returns: 'exists' if already in DOM, 'injected' if freshly added, false if can't inject
   function injectFolderUI() {
     const dataPane = document.querySelector('.data-pane .queries-container');
     if (!dataPane) return false;
-    if (dataPane.querySelector('.qf-folder-header')) return true; // Already injected
+    if (dataPane.querySelector('.qf-folder-header')) return 'exists';
 
-    // Find the query list element
     const queryList = dataPane.querySelector('.query-list');
     if (!queryList) return false;
 
-    // Create folder header
     const folderHeader = document.createElement('div');
     folderHeader.className = 'qf-folder-header';
     folderHeader.innerHTML = `
@@ -747,27 +746,23 @@
         </button>
       </span>`;
 
-    // Create folder tree container
     const folderTree = document.createElement('div');
     folderTree.className = 'qf-folder-tree';
 
-    // Insert before the query list
     queryList.parentNode.insertBefore(folderHeader, queryList);
     queryList.parentNode.insertBefore(folderTree, queryList);
 
-    return true;
+    return 'injected';
   }
 
   // ===================== INITIALIZATION =====================
   function tryInit() {
-    // Check if query panel is rendered
     const queryManager = document.getElementById('query-manager');
     if (!queryManager) return;
 
     const dataPane = document.querySelector('.data-pane .queries-container');
     if (!dataPane) return;
 
-    // Detect app version ID
     const versionId = detectAppVersionId();
     if (!versionId) return;
 
@@ -779,14 +774,19 @@
       state.initialized = false;
     }
 
-    // Inject UI
-    if (injectFolderUI() && !state.initialized) {
+    const injectResult = injectFolderUI();
+    if (!injectResult) return;
+
+    if (!state.initialized) {
+      // First time: load from server
       state.initialized = true;
       loadFolders();
-      setupDragAndDrop();
+    } else if (injectResult === 'injected') {
+      // Panel was reopened: DOM was destroyed and re-created, re-render from cached state
+      renderFolderTree();
+      applyFolderFilter();
     }
 
-    // Re-setup drag and drop when query list changes
     setupDragAndDrop();
   }
 
