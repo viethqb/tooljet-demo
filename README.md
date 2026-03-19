@@ -2,7 +2,6 @@
 
 Custom Docker image based on `tooljet/tooljet-ee:v3.20.60-lts` with the following additions:
 
-- **Custom License** — Overrides EE licensing configuration
 - **Pyodide Packages** — Adds `openpyxl` and `et_xmlfile` to Pyodide for Python query support
 - **Query Folders** — Adds folder management for organizing queries in the App Builder
 
@@ -124,7 +123,7 @@ ALTER TABLE data_queries ADD COLUMN folder_id UUID REFERENCES query_folders(id) 
 ## File Structure
 
 ```
-tooljet-docker-custom/
+tooljet-demo/
 ├── Dockerfile
 ├── docker-compose.yaml
 ├── .env                          # Your environment variables
