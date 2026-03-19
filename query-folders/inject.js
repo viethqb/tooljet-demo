@@ -52,7 +52,6 @@
     if (versionMatch) {
       const newVersionId = versionMatch[1];
       if (newVersionId !== _detectedVersionId) {
-        console.log('[QueryFolders] Captured version ID from data-queries:', newVersionId);
         _detectedVersionId = newVersionId;
         if (state.appVersionId && state.appVersionId !== newVersionId) {
           state.appVersionId = newVersionId;
@@ -123,10 +122,9 @@
           state.queryFolderMap[q.id] = q.folder_id;
         }
       });
-      console.log('[QueryFolders] Loaded:', state.folders.length, 'folders,',
-        Object.keys(state.queryFolderMap).length, 'query mappings, active:', state.activeFolderId);
       renderFolderTree();
       applyFolderFilter();
+      setupDragAndDrop();
     } catch (err) {
       console.error('[QueryFolders] Error loading folders:', err);
     } finally {
@@ -211,7 +209,6 @@
         const match = entry.name.match(/\/api\/data-queries\/([a-f0-9-]{36})(?:\?|$)/);
         if (match) {
           _detectedVersionId = match[1];
-          console.log('[QueryFolders] Detected version ID from perf entries:', _detectedVersionId);
           return _detectedVersionId;
         }
       }
@@ -231,7 +228,6 @@
               const store = fiber.memoizedProps?.store || fiber.pendingProps?.store;
               const storeState = store.getState?.();
               if (storeState?.currentVersionId) {
-                console.log('[QueryFolders] Detected version ID from store:', storeState.currentVersionId);
                 return storeState.currentVersionId;
               }
             }
@@ -243,7 +239,6 @@
       // Ignore fiber traversal errors
     }
 
-    console.log('[QueryFolders] Could not detect version ID yet');
     return null;
   }
 
@@ -333,26 +328,26 @@
 
     tree.forEach(renderFolder);
     container.innerHTML = html;
+    // Event listeners are handled by persistent delegation set up in bindFolderTreeEvents()
+  }
 
-    // Attach event listeners via delegation
+  // One-time delegation setup on the folder tree container (called once, never re-added)
+  let _folderTreeBound = false;
+  function bindFolderTreeEvents() {
+    if (_folderTreeBound) return;
+    const container = document.querySelector('.qf-folder-tree');
+    if (!container) return;
+    _folderTreeBound = true;
+
     container.addEventListener('click', (e) => {
       const actionEl = e.target.closest('[data-action]');
       if (!actionEl) return;
       const action = actionEl.dataset.action;
       const folderId = actionEl.dataset.folderId;
-
-      if (action === 'toggle') {
-        e.stopPropagation();
-        window.__qf.toggleFolder(folderId);
-      } else if (action === 'rename') {
-        e.stopPropagation();
-        window.__qf.showRenameModal(folderId);
-      } else if (action === 'delete') {
-        e.stopPropagation();
-        window.__qf.showDeleteConfirm(folderId);
-      } else if (action === 'select') {
-        window.__qf.setActiveFolder(folderId || null);
-      }
+      if (action === 'toggle') { e.stopPropagation(); window.__qf.toggleFolder(folderId); }
+      else if (action === 'rename') { e.stopPropagation(); window.__qf.showRenameModal(folderId); }
+      else if (action === 'delete') { e.stopPropagation(); window.__qf.showDeleteConfirm(folderId); }
+      else if (action === 'select') { window.__qf.setActiveFolder(folderId || null); }
     });
 
     container.addEventListener('contextmenu', (e) => {
@@ -362,16 +357,26 @@
       }
     });
 
-    // Drag-and-drop on folder items
-    container.querySelectorAll('[data-drop-target]').forEach((el) => {
-      el.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; el.classList.add('drop-target'); });
-      el.addEventListener('dragleave', () => { el.classList.remove('drop-target'); });
-      el.addEventListener('drop', (e) => {
-        e.preventDefault();
-        el.classList.remove('drop-target');
-        const queryId = e.dataTransfer.getData('text/plain') || state.dragQueryId;
-        if (queryId) moveQueryToFolder(queryId, el.dataset.folderId);
-      });
+    container.addEventListener('dragover', (e) => {
+      const target = e.target.closest('[data-drop-target]');
+      if (!target) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      target.classList.add('drop-target');
+    });
+
+    container.addEventListener('dragleave', (e) => {
+      const target = e.target.closest('[data-drop-target]');
+      if (target) target.classList.remove('drop-target');
+    });
+
+    container.addEventListener('drop', (e) => {
+      const target = e.target.closest('[data-drop-target]');
+      if (!target) return;
+      e.preventDefault();
+      target.classList.remove('drop-target');
+      const queryId = e.dataTransfer.getData('text/plain') || state.dragQueryId;
+      if (queryId) moveQueryToFolder(queryId, target.dataset.folderId);
     });
   }
 
@@ -432,14 +437,16 @@
   }
 
   // ===================== DRAG AND DROP =====================
+  const _boundDragRows = new WeakSet();
   function setupDragAndDrop() {
     const queryRows = document.querySelectorAll('.query-list .query-row');
     queryRows.forEach((row) => {
-      if (row.getAttribute('draggable') === 'true') return; // Already set up
+      if (_boundDragRows.has(row)) return;
 
       const queryId = getQueryIdFromRow(row);
       if (!queryId) return;
 
+      _boundDragRows.add(row);
       row.setAttribute('draggable', 'true');
       row.addEventListener('dragstart', (e) => {
         state.dragQueryId = queryId;
@@ -447,7 +454,6 @@
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', queryId);
       });
-
       row.addEventListener('dragend', () => {
         state.dragQueryId = null;
         row.classList.remove('qf-dragging');
@@ -690,38 +696,32 @@
   }
 
   // ===================== QUERY CARD CONTEXT MENU INJECTION =====================
+  // Uses the same main MutationObserver (no extra observer).
+  // Called from debouncedTryInit cycle.
   function injectMoveToFolderOption() {
-    // Watch for the query card context menu (handler menu)
-    const observer = new MutationObserver(() => {
-      const menus = document.querySelectorAll('[class*="query-handler-menu"]');
-      menus.forEach((menu) => {
-        if (menu.querySelector('.qf-move-to-folder-btn')) return; // Already injected
+    const menus = document.querySelectorAll('[class*="query-handler-menu"]');
+    menus.forEach((menu) => {
+      if (menu.querySelector('.qf-move-to-folder-btn')) return;
 
-        // Find the query ID from the menu
-        const menuId = menu.id || '';
-        const queryId = menuId.replace('query-handler-menu-', '');
-        if (!queryId) return;
+      const menuId = menu.id || '';
+      const queryId = menuId.replace('query-handler-menu-', '');
+      if (!queryId) return;
 
-        // Find a good place to inject (after duplicate/before delete)
-        const menuItems = menu.querySelectorAll('[role="menuitem"], button, .dropdown-item');
-        if (menuItems.length > 0) {
-          const moveBtn = document.createElement('button');
-          moveBtn.className = (menuItems[0].className || '') + ' qf-move-to-folder-btn';
-          moveBtn.innerHTML = `${ICONS.move} Move to Folder`;
-          moveBtn.style.cssText = 'display:flex;align-items:center;gap:8px;width:100%;';
-          moveBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            menu.style.display = 'none';
-            showMoveQueryModal(queryId);
-          });
-
-          const lastItem = menuItems[menuItems.length - 1];
-          lastItem.parentNode.insertBefore(moveBtn, lastItem);
-        }
-      });
+      const menuItems = menu.querySelectorAll('[role="menuitem"], button, .dropdown-item');
+      if (menuItems.length > 0) {
+        const moveBtn = document.createElement('button');
+        moveBtn.className = (menuItems[0].className || '') + ' qf-move-to-folder-btn';
+        moveBtn.innerHTML = `${ICONS.move} Move to Folder`;
+        moveBtn.style.cssText = 'display:flex;align-items:center;gap:8px;width:100%;';
+        moveBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          menu.style.display = 'none';
+          showMoveQueryModal(queryId);
+        });
+        const lastItem = menuItems[menuItems.length - 1];
+        lastItem.parentNode.insertBefore(moveBtn, lastItem);
+      }
     });
-
-    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   // ===================== TOAST =====================
@@ -796,17 +796,26 @@
     const injectResult = injectFolderUI();
     if (!injectResult) return;
 
+    if (injectResult === 'injected') {
+      // DOM was (re)created — need to rebind delegation listeners
+      _folderTreeBound = false;
+    }
+
+    bindFolderTreeEvents();
+
     if (!state.initialized) {
-      // First time: load from server
       state.initialized = true;
       loadFolders();
     } else if (injectResult === 'injected') {
-      // Panel was reopened: DOM was destroyed and re-created, re-render from cached state
+      // Panel reopened: re-render from cached state (no API call)
       renderFolderTree();
       applyFolderFilter();
     }
 
+    // Always check for new query rows that need drag-and-drop (React re-renders create new DOM)
     setupDragAndDrop();
+    // Check for query context menus that need "Move to Folder" button
+    injectMoveToFolderOption();
   }
 
   // ===================== GLOBAL API =====================
@@ -859,57 +868,53 @@
   };
 
   // ===================== OBSERVERS =====================
-  // Observe DOM changes to re-inject when React re-renders
-  const mainObserver = new MutationObserver(() => {
-    tryInit();
-  });
+  // Debounced tryInit — prevents hundreds of calls from MutationObserver
+  let _tryInitTimer = null;
+  function debouncedTryInit() {
+    if (_tryInitTimer) return;
+    _tryInitTimer = setTimeout(() => {
+      _tryInitTimer = null;
+      tryInit();
+    }, 300);
+  }
 
-  mainObserver.observe(document.body, {
-    childList: true,
-    subtree: true,
-  });
+  // Observe only the query-manager area, not the entire body
+  let _currentObserverTarget = null;
+  function setupObserver() {
+    const target = document.getElementById('query-manager') || document.body;
+    if (target === _currentObserverTarget) return;
+
+    if (_currentObserverTarget) mainObserver.disconnect();
+    _currentObserverTarget = target;
+    mainObserver.observe(target, { childList: true, subtree: true });
+  }
+
+  const mainObserver = new MutationObserver(debouncedTryInit);
 
   // URL change detection (SPA navigation)
-  let lastUrl = window.location.href;
-  const urlObserver = new MutationObserver(() => {
-    if (window.location.href !== lastUrl) {
-      lastUrl = window.location.href;
-      state.initialized = false;
-      state.appVersionId = null;
-      setTimeout(tryInit, 1000);
-    }
-  });
-  urlObserver.observe(document.querySelector('head > title') || document.head, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-  });
-
-  // Also listen for popstate
   window.addEventListener('popstate', () => {
     state.initialized = false;
     state.appVersionId = null;
-    setTimeout(tryInit, 1000);
+    _detectedVersionId = null;
+    setTimeout(debouncedTryInit, 500);
   });
 
-  // Initial attempt
+  // Initial setup
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(tryInit, 2000));
+    document.addEventListener('DOMContentLoaded', () => setTimeout(() => { setupObserver(); tryInit(); }, 2000));
   } else {
-    setTimeout(tryInit, 2000);
+    setTimeout(() => { setupObserver(); tryInit(); }, 2000);
   }
 
-  // Periodic re-check (fallback)
+  // Lightweight periodic check — only runs if injection is missing (panel toggle)
   setInterval(() => {
+    // Narrow the observer to query-manager once it exists
+    setupObserver();
+    // Re-inject only if DOM was destroyed
     const dataPane = document.querySelector('.data-pane .queries-container');
     if (dataPane && !dataPane.querySelector('.qf-folder-header')) {
-      state.initialized = false;
       tryInit();
     }
-  }, 5000);
+  }, 3000);
 
-  // Inject "Move to Folder" option in query context menus
-  injectMoveToFolderOption();
-
-  console.log('[QueryFolders] Injection script loaded');
 })();
