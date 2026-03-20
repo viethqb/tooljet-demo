@@ -119,6 +119,21 @@ let QueryFoldersService = class QueryFoldersService {
     async ensureDefaultFolder(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             const orgId = user.organizationId;
+
+            // Check if this version already has folders
+            const existingFolders = await manager.query(
+                `SELECT id FROM query_folders WHERE app_version_id = $1 AND organization_id = $2 LIMIT 1`,
+                [appVersionId, orgId]
+            );
+
+            if (existingFolders.length === 0) {
+                // No folders for this version — try to clone from a previous version
+                const cloned = await this.cloneFoldersFromPreviousVersion(manager, appVersionId, orgId);
+                if (cloned) {
+                    return { folder: null, cloned: true };
+                }
+            }
+
             // Find or create "Ungrouped" default folder
             let rows = await manager.query(
                 `SELECT * FROM query_folders
@@ -134,21 +149,16 @@ let QueryFoldersService = class QueryFoldersService {
                      RETURNING *`,
                     [appVersionId, orgId]
                 );
-                if (inserted.length > 0) {
-                    defaultFolder = inserted[0];
-                } else {
-                    // Was created by a concurrent request
-                    rows = await manager.query(
-                        `SELECT * FROM query_folders
-                         WHERE name = 'Ungrouped' AND app_version_id = $1 AND organization_id = $2 AND parent_id IS NULL`,
-                        [appVersionId, orgId]
-                    );
-                    defaultFolder = rows[0];
-                }
+                defaultFolder = inserted.length > 0 ? inserted[0] : (await manager.query(
+                    `SELECT * FROM query_folders
+                     WHERE name = 'Ungrouped' AND app_version_id = $1 AND organization_id = $2 AND parent_id IS NULL`,
+                    [appVersionId, orgId]
+                ))[0];
             } else {
                 defaultFolder = rows[0];
             }
-            // Assign all unassigned queries to the default folder
+
+            // Assign unassigned queries to default folder
             await manager.query(
                 `UPDATE data_queries SET folder_id = $1
                  WHERE app_version_id = $2 AND (folder_id IS NULL)`,
@@ -156,6 +166,72 @@ let QueryFoldersService = class QueryFoldersService {
             );
             return { folder: defaultFolder };
         });
+    }
+
+    async cloneFoldersFromPreviousVersion(manager, appVersionId, orgId) {
+        // Find the app_id for this version
+        const versionRows = await manager.query(
+            `SELECT app_id FROM app_versions WHERE id = $1`, [appVersionId]
+        );
+        if (versionRows.length === 0) return false;
+        const appId = versionRows[0].app_id;
+
+        // Find the most recent version of this app that HAS folders (not current version)
+        const sourceRows = await manager.query(
+            `SELECT DISTINCT qf.app_version_id
+             FROM query_folders qf
+             JOIN app_versions av ON av.id = qf.app_version_id
+             WHERE av.app_id = $1 AND qf.app_version_id != $2 AND qf.organization_id = $3
+             ORDER BY qf.app_version_id
+             LIMIT 1`,
+            [appId, appVersionId, orgId]
+        );
+        if (sourceRows.length === 0) return false;
+        const sourceVersionId = sourceRows[0].app_version_id;
+
+        // Get all folders from source version (ordered to process parents first)
+        const sourceFolders = await manager.query(
+            `SELECT * FROM query_folders
+             WHERE app_version_id = $1 AND organization_id = $2
+             ORDER BY parent_id NULLS FIRST, name`,
+            [sourceVersionId, orgId]
+        );
+        if (sourceFolders.length === 0) return false;
+
+        // Clone folders, mapping old IDs to new IDs
+        const idMap = {}; // oldFolderId -> newFolderId
+        for (const folder of sourceFolders) {
+            const newParentId = folder.parent_id ? (idMap[folder.parent_id] || null) : null;
+            const inserted = await manager.query(
+                `INSERT INTO query_folders (name, parent_id, app_version_id, organization_id)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT ON CONSTRAINT uq_query_folder_name DO NOTHING
+                 RETURNING *`,
+                [folder.name, newParentId, appVersionId, orgId]
+            );
+            if (inserted.length > 0) {
+                idMap[folder.id] = inserted[0].id;
+            }
+        }
+
+        // Map queries to folders by matching query names between versions
+        const sourceQueries = await manager.query(
+            `SELECT name, folder_id FROM data_queries
+             WHERE app_version_id = $1 AND folder_id IS NOT NULL`,
+            [sourceVersionId]
+        );
+
+        for (const sq of sourceQueries) {
+            const newFolderId = idMap[sq.folder_id];
+            if (!newFolderId) continue;
+            await manager.query(
+                `UPDATE data_queries SET folder_id = $1
+                 WHERE app_version_id = $2 AND name = $3 AND folder_id IS NULL`,
+                [newFolderId, appVersionId, sq.name]
+            );
+        }
+
+        return true;
     }
 
     async getDescendantIds(manager, folderId) {
