@@ -1,4 +1,4 @@
-FROM tooljet/tooljet-ee:v3.20.60-lts
+FROM tooljet/tooljet-ee:v3.20.126-lts
 
 USER root
 
@@ -21,16 +21,10 @@ RUN python3 /tmp/add_pyodide_package.py && \
     apt-get clean
 
 # ===================== Query Folders: Backend Module (pre-built JS) =====================
-# Module registration (static import from app module)
 COPY query-folders/dist/module.js /app/server/dist/src/modules/query-folders/module.js
-
-# EE dynamic imports (SubModule loads from dist/ee/ in EE edition)
 COPY query-folders/dist/ee/ /app/server/dist/ee/query-folders/
-
-# TypeORM migration (runs automatically via EE entrypoint db:migrate)
 COPY query-folders/dist/migrations/1760000000000-CreateQueryFolders.js /app/server/dist/migrations/1760000000000-CreateQueryFolders.js
 
-# Patch the EE app module.js to register QueryFoldersModule
 COPY query-folders/patch-app-module.js /tmp/patch-app-module.js
 RUN node /tmp/patch-app-module.js && rm /tmp/patch-app-module.js
 
@@ -41,13 +35,29 @@ COPY query-folders/entrypoint.sh /app/query-folders/entrypoint.sh
 
 RUN chmod +x /app/query-folders/entrypoint.sh
 
+# ===================== Pivot Table Config: Backend Module (pre-built JS) =====================
+COPY pivot-table-config/dist/module.js /app/server/dist/src/modules/pivot-table-config/module.js
+COPY pivot-table-config/dist/ee/ /app/server/dist/ee/pivot-table-config/
+COPY pivot-table-config/dist/migrations/1760100000000-CreatePivotTableConfig.js /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js
+
+COPY pivot-table-config/patch-app-module.js /tmp/patch-app-module.js
+RUN node /tmp/patch-app-module.js && rm /tmp/patch-app-module.js
+
+# ===================== Pivot Table: Frontend Injection =====================
+COPY pivot-table/inject.js /app/pivot-table/inject.js
+COPY pivot-table/inject.css /app/pivot-table/inject.css
+
 # ===================== Permissions =====================
 RUN chown -R appuser:0 /app/server/dist/ee/licensing/configs/License.js && \
     chown -R appuser:0 /app/server/dist/src/modules/licensing/configs/License.js && \
     chown -R appuser:0 /app/server/dist/src/modules/query-folders/ && \
     chown -R appuser:0 /app/server/dist/ee/query-folders/ && \
     chown -R appuser:0 /app/server/dist/migrations/1760000000000-CreateQueryFolders.js && \
-    chown -R appuser:0 /app/query-folders/
+    chown -R appuser:0 /app/server/dist/src/modules/pivot-table-config/ && \
+    chown -R appuser:0 /app/server/dist/ee/pivot-table-config/ && \
+    chown -R appuser:0 /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js && \
+    chown -R appuser:0 /app/query-folders/ && \
+    chown -R appuser:0 /app/pivot-table/
 
 USER appuser
 

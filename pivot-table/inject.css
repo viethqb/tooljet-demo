@@ -1,0 +1,399 @@
+/* =====================================================================
+   INSPECTOR SIDEBAR: Pivot Table Config Section
+   ===================================================================== */
+
+/* Property row layout (label + control) */
+.pivot-prop-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-weak, rgba(0, 0, 0, 0.06));
+}
+
+.pivot-prop-row:last-child {
+  border-bottom: none;
+}
+
+/* Stacked layout for checkbox lists */
+.pivot-prop-row-stack {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+/* Refresh columns button */
+.pivot-refresh-btn {
+  width: 100%;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  background: var(--white, #fff);
+  color: var(--slate11, #687076);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.pivot-refresh-btn:hover {
+  background: var(--slate3, #f1f3f5);
+  border-color: var(--indigo9, #3e63dd);
+  color: var(--indigo9, #3e63dd);
+}
+
+.pivot-prop-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--slate12, #11181c);
+  white-space: nowrap;
+  min-width: 90px;
+  flex-shrink: 0;
+}
+
+/* Toggle switch (matching ToolJet style) */
+.pivot-toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.pivot-toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.pivot-toggle-slider {
+  position: absolute;
+  inset: 0;
+  background-color: var(--slate7, #d9dbdd);
+  border-radius: 18px;
+  transition: 0.2s;
+}
+
+.pivot-toggle-slider::before {
+  content: '';
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  bottom: 2px;
+  background-color: #fff;
+  border-radius: 50%;
+  transition: 0.2s;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.pivot-toggle-switch input:checked + .pivot-toggle-slider {
+  background-color: var(--indigo9, #3e63dd);
+}
+
+.pivot-toggle-switch input:checked + .pivot-toggle-slider::before {
+  transform: translateX(14px);
+}
+
+/* Select dropdown */
+.pivot-cfg-select {
+  width: 100%;
+  max-width: 160px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  background: var(--white, #fff);
+  color: var(--slate12, #11181c);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s;
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%23889096' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
+}
+
+.pivot-cfg-select:focus {
+  border-color: var(--indigo9, #3e63dd);
+}
+
+/* Text input */
+.pivot-cfg-input {
+  width: 100%;
+  max-width: 160px;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  background: var(--white, #fff);
+  color: var(--slate12, #11181c);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.pivot-cfg-input:focus {
+  border-color: var(--indigo9, #3e63dd);
+}
+
+/* ===================== Ordered Picker ===================== */
+.pivot-picker {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pivot-picker-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  min-height: 4px;
+}
+
+.pivot-picker-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--indigo11, #3a5bc7);
+  background: rgba(62, 99, 221, 0.08);
+  border: 1px solid rgba(62, 99, 221, 0.2);
+  border-radius: 4px;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+
+.pivot-picker-tag-x {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--indigo8, #7b93db);
+  margin-left: 2px;
+  line-height: 1;
+}
+
+.pivot-picker-tag-x:hover {
+  color: #e5484d;
+}
+
+.pivot-picker-add {
+  width: 100%;
+}
+
+.pivot-hint {
+  font-size: 11px;
+  color: var(--slate9, #889096);
+  font-style: italic;
+  padding: 4px 0;
+}
+
+/* Config fields container */
+.pivot-cfg-fields {
+  margin-top: 4px;
+}
+
+/* Accordion trigger animation */
+.pivot-trigger {
+  transition: transform 0.3s;
+  display: inherit !important;
+  height: 1rem;
+  width: 1rem;
+  padding: 0.25rem;
+}
+
+.pivot-trigger:not(.collapsed) {
+  transform: rotate(90deg);
+}
+
+/* =====================================================================
+   CANVAS: Pivot Overlay (Editor Preview + Viewer)
+   ===================================================================== */
+
+.pivot-overlay {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: auto;
+  background: var(--cc-surface1-surface, #fff);
+  min-height: 120px;
+}
+
+.pivot-result-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+}
+
+.pivot-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 80px;
+  color: var(--slate9, #889096);
+  font-size: 13px;
+}
+
+/* =====================================================================
+   PIVOT TABLE RESULT
+   ===================================================================== */
+
+.pivot-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.pivot-table th,
+.pivot-table td {
+  padding: 6px 10px;
+  border: 1px solid var(--cc-default-border, #e6e8eb);
+  text-align: left;
+}
+
+.pivot-table thead th {
+  background: var(--cc-surface2-surface, #f8f9fa);
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--slate11, #687076);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  white-space: nowrap;
+}
+
+.pivot-row-header {
+  min-width: 100px;
+}
+
+.pivot-row-label {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.pivot-cell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pivot-total-cell {
+  background: rgba(62, 99, 221, 0.03);
+  font-weight: 600;
+}
+
+.pivot-total-header {
+  background: rgba(62, 99, 221, 0.06) !important;
+}
+
+/* Section label in Inspector */
+.pivot-section-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--slate9, #889096);
+  padding: 8px 0 2px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border-weak, rgba(0, 0, 0, 0.06));
+}
+
+/* Subtotal row */
+.pivot-subtotal td {
+  background: rgba(62, 99, 221, 0.03);
+  border-top: 1px dashed var(--cc-default-border, #d9dbdd);
+}
+
+.pivot-grand-total td {
+  background: var(--cc-surface2-surface, #f1f3f5);
+  border-top: 2px solid var(--cc-default-border, #d9dbdd);
+}
+
+/* =====================================================================
+   PIVOT TITLE BAR (shared between editor preview and viewer)
+   ===================================================================== */
+
+.pivot-title-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 4px;
+  flex-shrink: 0;
+}
+
+.pivot-title-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--slate12, #11181c);
+}
+
+.pivot-title-agg-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(62, 99, 221, 0.08);
+  color: var(--indigo9, #3e63dd);
+}
+
+/* =====================================================================
+   DARK THEME
+   ===================================================================== */
+
+.dark-theme .pivot-prop-label {
+  color: var(--slate12, #ecedee);
+}
+
+.dark-theme .pivot-cfg-select,
+.dark-theme .pivot-cfg-input {
+  background: var(--slate3, #1a1d21);
+  border-color: var(--slate7, #333);
+  color: var(--slate12, #ecedee);
+}
+
+.dark-theme .pivot-picker-tag {
+  background: rgba(62, 99, 221, 0.15);
+  border-color: rgba(62, 99, 221, 0.3);
+  color: var(--indigo10, #7b93db);
+}
+
+.dark-theme .pivot-table thead th {
+  background: var(--cc-surface2-surface, #1a1d21);
+}
+
+.dark-theme .pivot-grand-total td {
+  background: var(--cc-surface2-surface, #1a1d21);
+}
+
+.dark-theme .pivot-title-text {
+  color: var(--slate12, #ecedee);
+}
+
+/* =====================================================================
+   SCROLLBAR
+   ===================================================================== */
+
+.pivot-result-scroll::-webkit-scrollbar,
+.pivot-overlay::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.pivot-result-scroll::-webkit-scrollbar-thumb,
+.pivot-overlay::-webkit-scrollbar-thumb {
+  background: var(--cc-table-scroll-bar-color, #c1c8cd);
+  border-radius: 3px;
+}
+
+.pivot-result-scroll::-webkit-scrollbar-track,
+.pivot-overlay::-webkit-scrollbar-track {
+  background: transparent;
+}

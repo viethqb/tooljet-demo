@@ -40,6 +40,41 @@ services:
       - POSTGRES_USER=${PG_USER}
       - POSTGRES_PASSWORD=${PG_PASS}
 
+  starrocks:
+    container_name: starrocks
+    image: starrocks/allin1-ubuntu:latest
+    restart: always
+    ports:
+      - "${STARROCKS_PORT:-9030}:9030"
+      - "8030:8030"
+      - "8040:8040"
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./starrocks/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./starrocks/seed-entrypoint.sh:/docker-entrypoint-initdb.d/seed-entrypoint.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysql -h 127.0.0.1 -P 9030 -u root -e 'SELECT 1' || exit 1",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  starrocks-seed:
+    container_name: starrocks-seed
+    image: starrocks/allin1-ubuntu:latest
+    depends_on:
+      starrocks:
+        condition: service_healthy
+    volumes:
+      - ./starrocks/seed.sql:/seed.sql:ro
+    entrypoint: ["sh", "-c", "mysql -h starrocks -P 9030 -u root < /seed.sql && echo '[Seed] Done!'"]
+    restart: "no"
+
 volumes:
   postgres:
     driver: local
