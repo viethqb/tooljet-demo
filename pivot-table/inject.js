@@ -245,6 +245,11 @@
       showGrandTotal: true, grandTotalLabel: 'Grand Total',
       showSubtotal: false, subtotalLabel: 'Subtotal',
       backendPivot: false,
+      alignRowFields: 'left', alignColValues: 'right', alignRowTotal: 'right',
+      alignGrandTotal: 'right', alignSubtotal: 'right',
+      styleRowFields: 'bold', styleColValues: '', styleRowTotal: '',
+      styleGrandTotal: 'bold', styleSubtotal: 'bold italic',
+      emptyValue: '-',
     };
   }
 
@@ -448,6 +453,30 @@
     var numRowCols = rowFields.length || 1;
     var numColFields = colFields.length || 0;
 
+    // Alignment styles
+    var aRow = config.alignRowFields || 'left';
+    var aVal = config.alignColValues || 'right';
+    var aRT = config.alignRowTotal || 'right';
+    var aGT = config.alignGrandTotal || 'right';
+    var aST = config.alignSubtotal || 'right';
+    // Text styles
+    var sRow = config.styleRowFields || '';
+    var sVal = config.styleColValues || '';
+    var sRT = config.styleRowTotal || '';
+    var sGT = config.styleGrandTotal || '';
+    var sST = config.styleSubtotal || '';
+    // Empty cell display
+    var emptyVal = config.emptyValue !== undefined ? config.emptyValue : '0';
+
+    // Build inline style from alignment + text style string
+    function sf(align, style) {
+      var css = 'text-align:' + align;
+      css += ';font-weight:' + (style.indexOf('bold') !== -1 ? '600' : 'normal');
+      css += ';font-style:' + (style.indexOf('italic') !== -1 ? 'italic' : 'normal');
+      css += ';text-decoration:' + (style.indexOf('underline') !== -1 ? 'underline' : 'none');
+      return ' style="' + css + '"';
+    }
+
     // Split column key back to individual parts
     function colParts(ck) {
       return ck.split('\x00');
@@ -552,15 +581,15 @@
       var parts = rowFieldValues[rk] || [rk];
       var r = '<tr class="pivot-row">';
       for (var rfi = 0; rfi < numRowCols; rfi++) {
-        r += '<td class="pivot-row-label">' + esc(parts[rfi] ?? '') + '</td>';
+        r += '<td class="pivot-row-label"' + sf(aRow, sRow) + '>' + esc(parts[rfi] ?? '') + '</td>';
       }
       if (showCols) {
         for (var cj = 0; cj < colValues.length; cj++) {
           var vals = rd.cells[colValues[cj]] || [];
-          r += '<td class="pivot-cell">' + (vals.length ? aggFn(vals) : '') + '</td>';
+          r += '<td class="pivot-cell"' + sf(aVal, sVal) + '>' + (vals.length ? aggFn(vals) : esc(emptyVal)) + '</td>';
         }
       }
-      if (showRowTotal) r += '<td class="pivot-cell pivot-total-cell">' + aggFn(rd.values) + '</td>';
+      if (showRowTotal) r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + aggFn(rd.values) + '</td>';
       r += '</tr>';
       return r;
     }
@@ -568,7 +597,7 @@
     // Render subtotal row for a group
     function renderSubtotalRow(groupKeys, groupLabel) {
       var r = '<tr class="pivot-subtotal">';
-      r += '<td class="pivot-row-label" colspan="' + numRowCols + '"><em>' + esc(subtotalLabel) + '</em></td>';
+      r += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aST, sST) + '>' + esc(subtotalLabel) + '</td>';
       if (showCols) {
         for (var sc = 0; sc < colValues.length; sc++) {
           var subVals = [];
@@ -576,7 +605,7 @@
             var cv2 = tree[groupKeys[sg]].cells[colValues[sc]] || [];
             for (var sv = 0; sv < cv2.length; sv++) subVals.push(cv2[sv]);
           }
-          r += '<td class="pivot-cell"><em>' + aggFn(subVals) + '</em></td>';
+          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + aggFn(subVals) + '</td>';
         }
       }
       if (showRowTotal) {
@@ -585,7 +614,7 @@
           var stv = tree[groupKeys[st]].values;
           for (var st2 = 0; st2 < stv.length; st2++) subTotal.push(stv[st2]);
         }
-        r += '<td class="pivot-cell pivot-total-cell"><em>' + aggFn(subTotal) + '</em></td>';
+        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + aggFn(subTotal) + '</td>';
       }
       r += '</tr>';
       return r;
@@ -613,7 +642,7 @@
     // Grand total row
     if (showGrandTotal) {
       h += '<tr class="pivot-grand-total">';
-      h += '<td class="pivot-row-label" colspan="' + numRowCols + '"><strong>' + esc(grandTotalLabel) + '</strong></td>';
+      h += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aGT, sGT) + '>' + esc(grandTotalLabel) + '</td>';
       if (showCols) {
         for (var ck = 0; ck < colValues.length; ck++) {
           var colTotal = [];
@@ -621,7 +650,7 @@
             var cv = tree[rowKeys[rri]].cells[colValues[ck]] || [];
             for (var vi = 0; vi < cv.length; vi++) colTotal.push(cv[vi]);
           }
-          h += '<td class="pivot-cell"><strong>' + aggFn(colTotal) + '</strong></td>';
+          h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + aggFn(colTotal) + '</td>';
         }
       }
       if (showRowTotal) {
@@ -630,7 +659,7 @@
           var gv = tree[rowKeys[gvi]].values;
           for (var gvj = 0; gvj < gv.length; gvj++) grandVals.push(gv[gvj]);
         }
-        h += '<td class="pivot-cell pivot-total-cell"><strong>' + aggFn(grandVals) + '</strong></td>';
+        h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + aggFn(grandVals) + '</td>';
       }
       h += '</tr>';
     }
@@ -852,12 +881,75 @@
       h += '<input type="text" class="pivot-cfg-input pivot-cfg-subtotalLabel" value="' + esc(config.subtotalLabel || 'Subtotal') + '" placeholder="Subtotal"/>';
       h += '</div>';
 
+      // --- Alignment & Style section ---
+      // Empty cell display
+      h += '<div class="pivot-prop-row">';
+      h += '<label class="pivot-prop-label">Empty Cell</label>';
+      h += '<select class="pivot-cfg-select pivot-cfg-emptyValue">';
+      var emptyOpts = [['0', '0'], ['', '(empty)'], ['null', 'Null'], ['-', '-'], ['N/A', 'N/A']];
+      for (var ei = 0; ei < emptyOpts.length; ei++) {
+        var eVal = emptyOpts[ei][0], eLabel = emptyOpts[ei][1];
+        h += '<option value="' + esc(eVal) + '"' + ((config.emptyValue !== undefined ? config.emptyValue : '0') === eVal ? ' selected' : '') + '>' + esc(eLabel) + '</option>';
+      }
+      h += '</select></div>';
+
+      h += '<div class="pivot-section-label">Formatting</div>';
+      h += buildFormatRow('Row Fields', 'RowFields', config);
+      h += buildFormatRow('Values', 'ColValues', config);
+      h += buildFormatRow('Row Total', 'RowTotal', config);
+      h += buildFormatRow('Grand Total', 'GrandTotal', config);
+      h += buildFormatRow('Subtotals', 'Subtotal', config);
+
       // Refresh columns button
       h += '<div class="pivot-prop-row">';
       h += '<button class="pivot-refresh-btn" type="button">Refresh Columns</button>';
       h += '</div>';
 
       h += '</div>'; // end pivot-cfg-fields
+      return h;
+    }
+
+    // Build a formatting row: label | [align buttons] [B] [I] [U]
+    function buildFormatRow(label, suffix, config) {
+      var alignKey = 'align' + suffix;
+      var styleKey = 'style' + suffix;
+      var currentAlign = config[alignKey] || (suffix === 'RowFields' ? 'left' : 'right');
+      var currentStyle = config[styleKey] || '';
+
+      var h = '<div class="pivot-prop-row">';
+      h += '<label class="pivot-prop-label">' + esc(label) + '</label>';
+      h += '<div class="pivot-format-group">';
+
+      // Alignment buttons
+      h += '<div class="pivot-align-group" data-key="' + alignKey + '">';
+      var aligns = ['left', 'center', 'right'];
+      for (var i = 0; i < aligns.length; i++) {
+        var val = aligns[i];
+        var active = val === currentAlign ? ' active' : '';
+        h += '<button type="button" class="pivot-align-btn' + active + '" data-align="' + val + '" data-key="' + alignKey + '" title="' + val + '">';
+        h += '<span style="text-align:' + val + ';display:block;width:14px;font-size:9px;line-height:1.1">';
+        h += '<span style="display:block;width:' + (val === 'right' ? '14' : val === 'center' ? '10' : '12') + 'px;height:2px;background:currentColor;margin:1px ' + (val === 'right' ? '0 1px auto' : val === 'center' ? 'auto' : '0') + '"></span>';
+        h += '<span style="display:block;width:' + (val === 'right' ? '10' : val === 'center' ? '14' : '8') + 'px;height:2px;background:currentColor;margin:1px ' + (val === 'right' ? '0 1px auto' : val === 'center' ? 'auto' : '0') + '"></span>';
+        h += '<span style="display:block;width:' + (val === 'right' ? '12' : val === 'center' ? '8' : '14') + 'px;height:2px;background:currentColor;margin:1px ' + (val === 'right' ? '0 1px auto' : val === 'center' ? 'auto' : '0') + '"></span>';
+        h += '</span></button>';
+      }
+      h += '</div>';
+
+      // Style buttons (Bold, Italic, Underline) — toggle on/off
+      h += '<div class="pivot-style-group" data-key="' + styleKey + '">';
+      var styles = [
+        ['bold', '<strong>B</strong>'],
+        ['italic', '<em>I</em>'],
+        ['underline', '<span style="text-decoration:underline">U</span>'],
+      ];
+      for (var s = 0; s < styles.length; s++) {
+        var sVal = styles[s][0];
+        var sActive = currentStyle.indexOf(sVal) !== -1 ? ' active' : '';
+        h += '<button type="button" class="pivot-style-btn' + sActive + '" data-style="' + sVal + '" data-key="' + styleKey + '" title="' + sVal + '">' + styles[s][1] + '</button>';
+      }
+      h += '</div>';
+
+      h += '</div></div>';
       return h;
     }
 
@@ -930,6 +1022,25 @@
       var backendCb = section.querySelector('.pivot-cfg-backendPivot');
       if (backendCb) config.backendPivot = backendCb.checked;
 
+      var emptySel = section.querySelector('.pivot-cfg-emptyValue');
+      if (emptySel) config.emptyValue = emptySel.value;
+
+      // Read alignment from active buttons
+      var alignKeys = ['alignRowFields', 'alignColValues', 'alignRowTotal', 'alignGrandTotal', 'alignSubtotal'];
+      for (var ai = 0; ai < alignKeys.length; ai++) {
+        var activeBtn = section.querySelector('.pivot-align-btn.active[data-key="' + alignKeys[ai] + '"]');
+        if (activeBtn) config[alignKeys[ai]] = activeBtn.getAttribute('data-align');
+      }
+
+      // Read text styles from active style buttons
+      var styleKeys = ['styleRowFields', 'styleColValues', 'styleRowTotal', 'styleGrandTotal', 'styleSubtotal'];
+      for (var si = 0; si < styleKeys.length; si++) {
+        var activeBtns = section.querySelectorAll('.pivot-style-btn.active[data-key="' + styleKeys[si] + '"]');
+        var vals = [];
+        for (var sb = 0; sb < activeBtns.length; sb++) vals.push(activeBtns[sb].getAttribute('data-style'));
+        config[styleKeys[si]] = vals.join(' ');
+      }
+
       return config;
     }
 
@@ -976,7 +1087,7 @@
       }
 
       // Enable toggle + value field + aggregation
-      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal');
+      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue');
       for (var i = 0; i < simpleInputs.length; i++) {
         simpleInputs[i].addEventListener('change', onConfigChange);
       }
@@ -1024,6 +1135,30 @@
         textInputs[t].addEventListener('blur', onConfigChange);
         textInputs[t].addEventListener('keydown', function (e) {
           if (e.key === 'Enter') { e.preventDefault(); onConfigChange(); }
+        });
+      }
+
+      // Alignment buttons
+      var alignBtns = section.querySelectorAll('.pivot-align-btn');
+      for (var ab = 0; ab < alignBtns.length; ab++) {
+        alignBtns[ab].addEventListener('click', function (e) {
+          e.stopPropagation();
+          var key = this.getAttribute('data-key');
+          // Deactivate siblings in same group
+          var group = section.querySelectorAll('.pivot-align-btn[data-key="' + key + '"]');
+          for (var g = 0; g < group.length; g++) group[g].classList.remove('active');
+          this.classList.add('active');
+          onConfigChange();
+        });
+      }
+
+      // Style buttons (toggle: click once = on, click again = off)
+      var styleBtns = section.querySelectorAll('.pivot-style-btn');
+      for (var sb = 0; sb < styleBtns.length; sb++) {
+        styleBtns[sb].addEventListener('click', function (e) {
+          e.stopPropagation();
+          this.classList.toggle('active');
+          onConfigChange();
         });
       }
 
@@ -1123,7 +1258,15 @@
           // Backend pivot: call server API directly (no need for query to run on frontend)
           showOverlayMsg('Loading pivot data from server...');
           executePivotAsync(widgetName, config, function (err, rows) {
-            if (err) { showOverlayMsg('Backend pivot error: ' + err.message, true); return; }
+            if (err) {
+              // Fallback to frontend pivot silently
+              console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
+              extractDataAsync(tableEl, function (extracted) {
+                if (extracted.data.length > 0) { renderIntoOverlay(extracted.data); }
+                else { showOverlayMsg('No data available', false); }
+              });
+              return;
+            }
             var data = rows.map(function (row) {
               var r = {};
               for (var k in row) {
@@ -1286,7 +1429,15 @@
             _backendPivotPending[name] = true;
             executePivotAsync(name, config, function (err, rows) {
               _backendPivotPending[name] = false;
-              if (err) return;
+              if (err) {
+                // Fallback: try frontend pivot for keeper
+                extractDataAsync(tableEl, function (extracted) {
+                  if (extracted.data.length === 0) return;
+                  var ov2 = ensureOverlay();
+                  ov2.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config);
+                });
+                return;
+              }
               var data = rows.map(function (row) {
                 var r = {};
                 for (var k in row) {
@@ -1402,8 +1553,14 @@
         showLoading();
         executePivotAsync(name, config, function (err, rows) {
           if (err) {
-            console.error(LOG_PREFIX, 'Backend pivot error:', err.message);
-            showError('Backend pivot error: ' + err.message);
+            // Fallback: try frontend pivot sources
+            console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
+            var fallbackData = getDataForPivot();
+            if (fallbackData.length > 0) {
+              renderPivot(fallbackData);
+            } else {
+              showError('No data available. Query may have been deleted.');
+            }
             return;
           }
           // Reshape: backend returns flat GROUP BY rows with _pivot_value

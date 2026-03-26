@@ -28,6 +28,7 @@ docker logs -f Tooljet-app
 Adds configurable pivot table view to any Table widget. Developers configure the pivot in the editor's Inspector panel; end users see the aggregated report in the viewer.
 
 ![Pivot Table Feature](pivot_table.png)
+![Pivot Table Feature 1](pivot_table1.png)
 
 ### Capabilities
 

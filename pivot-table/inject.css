@@ -51,6 +51,116 @@
   flex-shrink: 0;
 }
 
+/* Alignment button group */
+.pivot-align-group {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pivot-align-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  border: none;
+  background: var(--white, #fff);
+  color: var(--slate9, #889096);
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.1s;
+}
+
+.pivot-align-btn:hover {
+  background: var(--slate3, #f1f3f5);
+  color: var(--slate12, #11181c);
+}
+
+.pivot-align-btn.active {
+  background: var(--indigo3, #edf2fe);
+  color: var(--indigo9, #3e63dd);
+}
+
+.dark-theme .pivot-align-btn {
+  background: var(--slate3, #1a1d21);
+  color: var(--slate8, #555);
+}
+
+.dark-theme .pivot-align-btn:hover {
+  background: var(--slate4, #252a2e);
+}
+
+.dark-theme .pivot-align-btn.active {
+  background: rgba(62, 99, 221, 0.15);
+  color: var(--indigo9, #3e63dd);
+}
+
+.dark-theme .pivot-align-group {
+  border-color: var(--slate7, #333);
+}
+
+/* Format group (align + style together) */
+.pivot-format-group {
+  display: flex;
+  gap: 4px;
+}
+
+/* Style button group (B, I, U) */
+.pivot-style-group {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pivot-style-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: var(--white, #fff);
+  color: var(--slate9, #889096);
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+  font-family: serif;
+  transition: all 0.1s;
+}
+
+.pivot-style-btn:hover {
+  background: var(--slate3, #f1f3f5);
+  color: var(--slate12, #11181c);
+}
+
+.pivot-style-btn.active {
+  background: var(--indigo3, #edf2fe);
+  color: var(--indigo9, #3e63dd);
+}
+
+.dark-theme .pivot-style-btn {
+  background: var(--slate3, #1a1d21);
+  color: var(--slate8, #555);
+}
+
+.dark-theme .pivot-style-btn:hover {
+  background: var(--slate4, #252a2e);
+}
+
+.dark-theme .pivot-style-btn.active {
+  background: rgba(62, 99, 221, 0.15);
+  color: var(--indigo9, #3e63dd);
+}
+
+.dark-theme .pivot-style-group {
+  border-color: var(--slate7, #333);
+}
+
 /* Toggle switch (matching ToolJet style) */
 .pivot-toggle-switch {
   position: relative;
@@ -285,7 +395,6 @@
 
 .pivot-total-cell {
   background: rgba(62, 99, 221, 0.03);
-  font-weight: 600;
 }
 
 .pivot-total-header {
