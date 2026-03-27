@@ -551,10 +551,13 @@
     }
     fontsXml += '</fonts>';
 
+    // Title style (index 0) gets no border, all others get border
     var xfXml = '<cellXfs count="' + xfEntries.length + '">';
     for (var xi = 0; xi < xfEntries.length; xi++) {
       var xf = xfEntries[xi];
-      xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="0" xfId="0" applyFont="1"';
+      var isTitle = (xi === 0); // styleList[0] = title
+      var bid = isTitle ? 0 : 1;
+      xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="' + bid + '" xfId="0" applyFont="1" applyBorder="1"';
       if (xf.align) {
         xfXml += ' applyAlignment="1"><alignment horizontal="' + xf.align + '"/></xf>';
       } else {
@@ -563,11 +566,20 @@
     }
     xfXml += '</cellXfs>';
 
+    var bordersXml = '<borders count="2">' +
+      '<border><left/><right/><top/><bottom/><diagonal/></border>' +
+      '<border>' +
+      '<left style="thin"><color auto="1"/></left>' +
+      '<right style="thin"><color auto="1"/></right>' +
+      '<top style="thin"><color auto="1"/></top>' +
+      '<bottom style="thin"><color auto="1"/></bottom>' +
+      '<diagonal/></border></borders>';
+
     var stylesFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
       '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
       fontsXml +
       '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>' +
-      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+      bordersXml +
       '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
       xfXml + '</styleSheet>';
 
