@@ -445,7 +445,7 @@
     // Extract grid from DOM
     var grid = [], merges = [], rowIdx = 0;
     if (title) {
-      grid.push([{ v: title, s: 0 }]); // style 0 = title
+      grid.push([{ v: title, s: 0, _si: 0 }]);
       if (totalCols > 1) merges.push([0, 0, 0, totalCols - 1]);
       grid.push([]); rowIdx = 2;
     }
@@ -501,9 +501,13 @@
     var ss = [], ssMap = {};
     function si(str) { str = String(str); if (ssMap[str] !== undefined) return ssMap[str]; var i = ss.length; ss.push(str); ssMap[str] = i; return i; }
 
-    // Styles: unique combos of bold/italic/align/fill
-    var styleMap = { '_title': 0 };
-    var styleList = [{ b: true, i: false, a: 'center', sz: 14 }]; // 0 = title
+    // Styles: index 0 = default (plain), index 1 = title, index 2+ = data
+    var styleList = [
+      { b: false, i: false, a: null, sz: 11 },       // 0: default plain
+      { b: true, i: false, a: 'center', sz: 14 },    // 1: title
+    ];
+    var TITLE_STYLE = 1;
+    var styleMap = {};
     function getStyleIdx(sk, align) {
       var key = sk + '|' + (align || '');
       if (styleMap[key] !== undefined) return styleMap[key];
@@ -516,7 +520,7 @@
     for (var gr = 0; gr < grid.length; gr++) {
       for (var gc = 0; gc < grid[gr].length; gc++) {
         var c = grid[gr][gc];
-        if (gr === 0 && title) { c._si = 0; continue; }
+        if (gr === 0 && title) { c._si = TITLE_STYLE; continue; }
         c._si = getStyleIdx(c.sk, c.a);
       }
     }
@@ -551,17 +555,26 @@
     }
     fontsXml += '</fonts>';
 
-    // Title style (index 0) gets no border, all others get border
+    // xf index 0 = default plain, index 1 = title, index 2+ = data
     var xfXml = '<cellXfs count="' + xfEntries.length + '">';
     for (var xi = 0; xi < xfEntries.length; xi++) {
       var xf = xfEntries[xi];
-      var isTitle = (xi === 0); // styleList[0] = title
-      var bid = isTitle ? 0 : 1;
-      xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="' + bid + '" xfId="0" applyFont="1" applyBorder="1"';
-      if (xf.align) {
-        xfXml += ' applyAlignment="1"><alignment horizontal="' + xf.align + '"/></xf>';
+      if (xi === 0) {
+        // Default plain style (required as index 0)
+        xfXml += '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>';
+      } else if (xi === 1) {
+        // Title: bold 14pt, centered, no border
+        xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="0" xfId="0"' +
+          ' applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>';
       } else {
-        xfXml += '/>';
+        // Data cells: with border
+        xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="1" xfId="0"' +
+          ' applyFont="1" applyBorder="1"';
+        if (xf.align) {
+          xfXml += ' applyAlignment="1"><alignment horizontal="' + xf.align + '"/></xf>';
+        } else {
+          xfXml += '/>';
+        }
       }
     }
     xfXml += '</cellXfs>';
@@ -610,6 +623,7 @@
     }
     var sheetFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + sheetRows + '</sheetData>' + mergeXml + '</worksheet>';
+
 
     var ssFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
       '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="' + ss.length + '" uniqueCount="' + ss.length + '">';
