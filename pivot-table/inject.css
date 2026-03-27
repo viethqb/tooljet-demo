@@ -325,11 +325,17 @@
    CANVAS: Pivot Overlay (Editor Preview + Viewer)
    ===================================================================== */
 
+/* When pivot overlay is active, table container should fit content */
+.jet-table.table-component:has(.pivot-overlay[style*="display: flex"]) {
+  height: auto !important;
+  min-height: auto !important;
+}
+
 .pivot-overlay {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  overflow: auto;
+  flex: 1 1 auto;
+  overflow: visible;
   background: var(--cc-surface1-surface, #fff);
   min-height: 120px;
 }

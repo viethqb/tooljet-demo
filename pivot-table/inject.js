@@ -419,6 +419,20 @@
   }
 
   // ===================== TITLE BAR =====================
+  // Adjust table widget height to fit pivot content (for dynamic height)
+  function adjustPivotHeight(tableEl, overlayEl) {
+    requestAnimationFrame(function () {
+      var pivotH = overlayEl.scrollHeight;
+      if (pivotH > 0) {
+        // Set min-height on the table widget container so dynamic height works
+        var header = tableEl.querySelector('.table-card-header');
+        var headerH = header ? header.offsetHeight : 0;
+        tableEl.style.minHeight = (pivotH + headerH + 4) + 'px';
+        tableEl.style.height = 'auto';
+      }
+    });
+  }
+
   function buildTitleHTML(config) {
     var title = (config.showTitle !== false && config.titleAlias) ? config.titleAlias : '';
     return '<div class="pivot-title-bar">' +
@@ -1509,6 +1523,7 @@
           ov.style.display = 'flex';
           ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
           bindDownloadButtons(ov, widgetName);
+          adjustPivotHeight(tableEl, ov);
         };
 
         var showOverlayMsg = function (msg, isError) {
@@ -1803,6 +1818,7 @@
         overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
         overlay.style.display = 'flex';
         bindDownloadButtons(overlay, name);
+        adjustPivotHeight(tableEl, overlay);
       }
 
       function showLoading() {
