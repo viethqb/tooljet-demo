@@ -635,8 +635,27 @@
       for (var mi = 0; mi < merges.length; mi++) { var m = merges[mi]; mergeXml += '<mergeCell ref="' + colRef(m[1]) + (m[0] + 1) + ':' + colRef(m[3]) + (m[2] + 1) + '"/>'; }
       mergeXml += '</mergeCells>';
     }
+    // Calculate column widths (autofit based on content length)
+    var colWidths = [];
+    for (var wr = 0; wr < grid.length; wr++) {
+      for (var wc = 0; wc < grid[wr].length; wc++) {
+        var cellVal = String(grid[wr][wc].v || '');
+        var len = cellVal.length;
+        // Approximate: 1 char ≈ 1.2 width units, min 8, max 50
+        var w = Math.max(len * 1.2 + 2, 8);
+        if (grid[wr][wc].sz === 14) w = Math.max(w, 10); // title font wider
+        if (!colWidths[wc] || w > colWidths[wc]) colWidths[wc] = w;
+      }
+    }
+    var colsXml = '<cols>';
+    for (var ci3 = 0; ci3 < colWidths.length; ci3++) {
+      var cw = Math.min(colWidths[ci3] || 10, 50);
+      colsXml += '<col min="' + (ci3 + 1) + '" max="' + (ci3 + 1) + '" width="' + cw.toFixed(1) + '" bestFit="1" customWidth="1"/>';
+    }
+    colsXml += '</cols>';
+
     var sheetFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + sheetRows + '</sheetData>' + mergeXml + '</worksheet>';
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' + colsXml + '<sheetData>' + sheetRows + '</sheetData>' + mergeXml + '</worksheet>';
 
 
     var ssFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
