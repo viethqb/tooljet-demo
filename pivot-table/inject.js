@@ -434,45 +434,216 @@
   function downloadPivotExcel(overlayEl, config, filename) {
     var table = overlayEl.querySelector('.pivot-table');
     if (!table) return;
-
     var title = (config && config.titleAlias) ? config.titleAlias : '';
+    var X = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
 
     // Count total columns
     var totalCols = 0;
     var fr = table.querySelector('tr');
-    if (fr) {
-      var fcs = fr.querySelectorAll('th, td');
-      for (var fi = 0; fi < fcs.length; fi++) totalCols += parseInt(fcs[fi].getAttribute('colspan') || '1', 10);
-    }
+    if (fr) { var fcs = fr.querySelectorAll('th, td'); for (var fi = 0; fi < fcs.length; fi++) totalCols += parseInt(fcs[fi].getAttribute('colspan') || '1', 10); }
 
-    // Build Excel HTML
-    var styles = '<style>' +
-      'table { border-collapse: collapse; }' +
-      'td, th { border: 1px solid #000; padding: 4px 8px; font-family: Arial, sans-serif; font-size: 11px; }' +
-      'th { background-color: #f0f0f0; font-weight: 600; }' +
-      '.pivot-total-cell { background-color: #f5f7ff; }' +
-      '.pivot-subtotal td { background-color: #fafafa; }' +
-      '.pivot-grand-total td { background-color: #f0f0f0; border-top: 2px solid #000; }' +
-      '</style>';
-
-    // Title inside thead
-    var tableHTML = table.innerHTML;
+    // Extract grid from DOM
+    var grid = [], merges = [], rowIdx = 0;
     if (title) {
-      var titleRows = '<tr><td colspan="' + (totalCols || 1) + '" style="font-size:14px;font-weight:bold;border:none;padding:8px 4px;text-align:center;background:none">' +
-        title.replace(/</g, '&lt;') + '</td></tr>' +
-        '<tr><td colspan="' + (totalCols || 1) + '" style="border:none;height:4px;background:none"></td></tr>';
-      tableHTML = tableHTML.replace(/<thead>/, '<thead>' + titleRows);
+      grid.push([{ v: title, s: 0 }]); // style 0 = title
+      if (totalCols > 1) merges.push([0, 0, 0, totalCols - 1]);
+      grid.push([]); rowIdx = 2;
+    }
+    // Grid map: tracks cells occupied by rowspan (key: "row,col" → true)
+    var occupied = {};
+    var trs = table.querySelectorAll('tr');
+    for (var ri = 0; ri < trs.length; ri++) {
+      var row = [];
+      var cells = trs[ri].querySelectorAll('th, td');
+      var ci = 0, colIdx = 0;
+      for (ci = 0; ci < cells.length; ci++) {
+        // Skip columns occupied by rowspan from previous rows
+        while (occupied[rowIdx + ',' + colIdx]) { row.push({ v: '', t: 's', sk: '', a: null }); colIdx++; }
+
+        var cell = cells[ci], text = cell.textContent.trim();
+        var colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
+        var rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
+        var isH = cell.tagName === 'TH';
+        var st = cell.getAttribute('style') || '';
+        var bld = isH || st.indexOf('600') !== -1 || st.indexOf('bold') !== -1;
+        var itl = st.indexOf('italic') !== -1;
+        var align = st.match(/text-align:\s*(left|center|right)/);
+        align = align ? align[1] : (isH ? 'center' : null);
+        var num = parseFloat(text.replace(/,/g, ''));
+        var isN = text && !isNaN(num) && isFinite(num) && /^-?[\d,.]+$/.test(text);
+        var sk = (bld ? 'b' : '') + (itl ? 'i' : '');
+
+        row.push({ v: isN ? num : text, t: isN ? 'n' : 's', sk: sk, a: align, h: isH });
+
+        // Register merge and mark occupied cells for rowspan
+        if (colspan > 1 || rowspan > 1) {
+          merges.push([rowIdx, colIdx, rowIdx + rowspan - 1, colIdx + colspan - 1]);
+          // Fill extra colspan cells in current row
+          for (var cp = 1; cp < colspan; cp++) row.push({ v: '', t: 's', sk: sk, a: align, h: isH });
+          // Mark cells occupied by rowspan for future rows
+          if (rowspan > 1) {
+            for (var rs = 1; rs < rowspan; rs++) {
+              for (var cs = 0; cs < colspan; cs++) {
+                occupied[(rowIdx + rs) + ',' + (colIdx + cs)] = true;
+              }
+            }
+          }
+        }
+        colIdx += colspan;
+      }
+      // Fill remaining occupied columns at end of row
+      while (occupied[rowIdx + ',' + colIdx]) { row.push({ v: '', t: 's', sk: '', a: null }); colIdx++; }
+      grid.push(row); rowIdx++;
     }
 
-    var html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">' +
-      '<head><meta charset="UTF-8">' + styles +
-      '<!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet>' +
-      '<x:Name>Pivot</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>' +
-      '</x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head><body>' +
-      '<table>' + tableHTML + '</table></body></html>';
+    // Build XLSX
+    // Shared strings
+    var ss = [], ssMap = {};
+    function si(str) { str = String(str); if (ssMap[str] !== undefined) return ssMap[str]; var i = ss.length; ss.push(str); ssMap[str] = i; return i; }
 
-    var blob = new Blob([html], { type: 'application/vnd.ms-excel;charset=utf-8;' });
-    triggerDownload(blob, (filename || 'pivot_table') + '.xls');
+    // Styles: unique combos of bold/italic/align/fill
+    var styleMap = { '_title': 0 };
+    var styleList = [{ b: true, i: false, a: 'center', sz: 14 }]; // 0 = title
+    function getStyleIdx(sk, align) {
+      var key = sk + '|' + (align || '');
+      if (styleMap[key] !== undefined) return styleMap[key];
+      var idx = styleList.length;
+      styleList.push({ b: sk.indexOf('b') !== -1, i: sk.indexOf('i') !== -1, a: align, sz: 11 });
+      styleMap[key] = idx;
+      return idx;
+    }
+    // Pre-assign styles for all cells
+    for (var gr = 0; gr < grid.length; gr++) {
+      for (var gc = 0; gc < grid[gr].length; gc++) {
+        var c = grid[gr][gc];
+        if (gr === 0 && title) { c._si = 0; continue; }
+        c._si = getStyleIdx(c.sk, c.a);
+      }
+    }
+
+    // Build styles.xml
+    var fontsXml = '', fontMap = {}, fontList = [];
+    // fontId=0 MUST be the default font (cellStyleXfs references it)
+    fontList.push({ b: false, i: false, sz: 11 });
+    fontMap['11'] = 0;
+    function getFontIdx(b, i, sz) {
+      var key = (b ? 'b' : '') + (i ? 'i' : '') + sz;
+      if (fontMap[key] !== undefined) return fontMap[key];
+      var idx = fontList.length;
+      fontList.push({ b: b, i: i, sz: sz });
+      fontMap[key] = idx;
+      return idx;
+    }
+    // Build xf entries
+    var xfEntries = [];
+    for (var si2 = 0; si2 < styleList.length; si2++) {
+      var s = styleList[si2];
+      var fi2 = getFontIdx(s.b, s.i, s.sz);
+      xfEntries.push({ fontId: fi2, align: s.a });
+    }
+
+    fontsXml = '<fonts count="' + fontList.length + '">';
+    for (var fl = 0; fl < fontList.length; fl++) {
+      fontsXml += '<font>';
+      if (fontList[fl].b) fontsXml += '<b/>';
+      if (fontList[fl].i) fontsXml += '<i/>';
+      fontsXml += '<sz val="' + fontList[fl].sz + '"/><name val="Arial"/></font>';
+    }
+    fontsXml += '</fonts>';
+
+    var xfXml = '<cellXfs count="' + xfEntries.length + '">';
+    for (var xi = 0; xi < xfEntries.length; xi++) {
+      var xf = xfEntries[xi];
+      xfXml += '<xf numFmtId="0" fontId="' + xf.fontId + '" fillId="0" borderId="0" xfId="0" applyFont="1"';
+      if (xf.align) {
+        xfXml += ' applyAlignment="1"><alignment horizontal="' + xf.align + '"/></xf>';
+      } else {
+        xfXml += '/>';
+      }
+    }
+    xfXml += '</cellXfs>';
+
+    var stylesFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      fontsXml +
+      '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>' +
+      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      xfXml + '</styleSheet>';
+
+    // Sheet XML
+    var colRef = function (c) { var s = ''; c++; while (c > 0) { s = String.fromCharCode(((c - 1) % 26) + 65) + s; c = Math.floor((c - 1) / 26); } return s; };
+    var sheetRows = '';
+    for (var r = 0; r < grid.length; r++) {
+      var row2 = grid[r];
+      if (!row2.length) { sheetRows += '<row r="' + (r + 1) + '"/>'; continue; }
+      sheetRows += '<row r="' + (r + 1) + '">';
+      for (var c2 = 0; c2 < row2.length; c2++) {
+        var cl = row2[c2], ref = colRef(c2) + (r + 1), sIdx = cl._si || 0;
+        if (cl.t === 'n' && cl.v !== '' && cl.v !== undefined) {
+          sheetRows += '<c r="' + ref + '" s="' + sIdx + '"><v>' + cl.v + '</v></c>';
+        } else if (cl.v) {
+          sheetRows += '<c r="' + ref + '" s="' + sIdx + '" t="s"><v>' + si(cl.v) + '</v></c>';
+        } else {
+          sheetRows += '<c r="' + ref + '" s="' + sIdx + '"/>';
+        }
+      }
+      sheetRows += '</row>';
+    }
+    var mergeXml = '';
+    if (merges.length) {
+      mergeXml = '<mergeCells count="' + merges.length + '">';
+      for (var mi = 0; mi < merges.length; mi++) { var m = merges[mi]; mergeXml += '<mergeCell ref="' + colRef(m[1]) + (m[0] + 1) + ':' + colRef(m[3]) + (m[2] + 1) + '"/>'; }
+      mergeXml += '</mergeCells>';
+    }
+    var sheetFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + sheetRows + '</sheetData>' + mergeXml + '</worksheet>';
+
+    var ssFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="' + ss.length + '" uniqueCount="' + ss.length + '">';
+    for (var s3 = 0; s3 < ss.length; s3++) ssFile += '<si><t>' + X(ss[s3]) + '</t></si>';
+    ssFile += '</sst>';
+
+    var wbFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="' + X(filename || 'Pivot').substring(0, 31) + '" sheetId="1" r:id="rId1"/></sheets></workbook>';
+    var ctFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
+    var relsFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
+    var wbRelsFile = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>';
+
+    var blob = _buildZip([
+      ['[Content_Types].xml', ctFile], ['_rels/.rels', relsFile], ['xl/workbook.xml', wbFile],
+      ['xl/_rels/workbook.xml.rels', wbRelsFile], ['xl/worksheets/sheet1.xml', sheetFile],
+      ['xl/styles.xml', stylesFile], ['xl/sharedStrings.xml', ssFile],
+    ]);
+    triggerDownload(blob, (filename || 'pivot_table') + '.xlsx');
+  }
+
+  // Minimal ZIP builder (STORE, no compression)
+  function _buildZip(files) {
+    var enc = new TextEncoder(), parts = [], cd = [], off = 0;
+    for (var i = 0; i < files.length; i++) {
+      var n = enc.encode(files[i][0]), d = enc.encode(files[i][1]), cr = _crc32(d);
+      var lh = new Uint8Array(30 + n.length), lv = new DataView(lh.buffer);
+      lv.setUint32(0, 0x04034b50, true); lv.setUint16(4, 20, true);
+      lv.setUint16(8, 0, true); lv.setUint32(14, cr, true);
+      lv.setUint32(18, d.length, true); lv.setUint32(22, d.length, true);
+      lv.setUint16(26, n.length, true); lh.set(n, 30);
+      var ce = new Uint8Array(46 + n.length), cv = new DataView(ce.buffer);
+      cv.setUint32(0, 0x02014b50, true); cv.setUint16(4, 20, true); cv.setUint16(6, 20, true);
+      cv.setUint32(16, cr, true); cv.setUint32(20, d.length, true); cv.setUint32(24, d.length, true);
+      cv.setUint16(28, n.length, true); cv.setUint32(42, off, true); ce.set(n, 46);
+      parts.push(lh, d); cd.push(ce); off += lh.length + d.length;
+    }
+    var cdOff = off, cdSz = 0;
+    for (var j = 0; j < cd.length; j++) { parts.push(cd[j]); cdSz += cd[j].length; }
+    var eo = new Uint8Array(22), ev = new DataView(eo.buffer);
+    ev.setUint32(0, 0x06054b50, true); ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true); ev.setUint32(12, cdSz, true); ev.setUint32(16, cdOff, true);
+    parts.push(eo);
+    return new Blob(parts, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+  function _crc32(b) {
+    var t = _crc32.t; if (!t) { t = _crc32.t = new Uint32Array(256); for (var i = 0; i < 256; i++) { var c = i; for (var j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[i] = c; } }
+    var r = 0xFFFFFFFF; for (var k = 0; k < b.length; k++) r = t[(r ^ b[k]) & 0xFF] ^ (r >>> 8); return (r ^ 0xFFFFFFFF) >>> 0;
   }
 
   function triggerDownload(blob, filename) {
