@@ -420,12 +420,85 @@
 
   // ===================== TITLE BAR =====================
   function buildTitleHTML(config) {
-    if (config.showTitle === false) return '';
-    var title = config.titleAlias || '';
-    if (!title) return '';
+    var title = (config.showTitle !== false && config.titleAlias) ? config.titleAlias : '';
     return '<div class="pivot-title-bar">' +
-      '<span class="pivot-title-text">' + esc(title) + '</span>' +
-      '</div>';
+      (title ? '<span class="pivot-title-text">' + esc(title) + '</span>' : '<span></span>') +
+      '<div class="pivot-toolbar">' +
+      '<button class="pivot-download-btn" data-format="excel" title="Download Excel">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+      ' Excel</button>' +
+      '</div></div>';
+  }
+
+  // ===================== DOWNLOAD =====================
+  function downloadPivotExcel(overlayEl, config, filename) {
+    var table = overlayEl.querySelector('.pivot-table');
+    if (!table) return;
+
+    var title = (config && config.titleAlias) ? config.titleAlias : '';
+
+    // Count total columns
+    var totalCols = 0;
+    var fr = table.querySelector('tr');
+    if (fr) {
+      var fcs = fr.querySelectorAll('th, td');
+      for (var fi = 0; fi < fcs.length; fi++) totalCols += parseInt(fcs[fi].getAttribute('colspan') || '1', 10);
+    }
+
+    // Build Excel HTML
+    var styles = '<style>' +
+      'table { border-collapse: collapse; }' +
+      'td, th { border: 1px solid #000; padding: 4px 8px; font-family: Arial, sans-serif; font-size: 11px; }' +
+      'th { background-color: #f0f0f0; font-weight: 600; }' +
+      '.pivot-total-cell { background-color: #f5f7ff; }' +
+      '.pivot-subtotal td { background-color: #fafafa; }' +
+      '.pivot-grand-total td { background-color: #f0f0f0; border-top: 2px solid #000; }' +
+      '</style>';
+
+    // Title inside thead
+    var tableHTML = table.innerHTML;
+    if (title) {
+      var titleRows = '<tr><td colspan="' + (totalCols || 1) + '" style="font-size:14px;font-weight:bold;border:none;padding:8px 4px;text-align:center;background:none">' +
+        title.replace(/</g, '&lt;') + '</td></tr>' +
+        '<tr><td colspan="' + (totalCols || 1) + '" style="border:none;height:4px;background:none"></td></tr>';
+      tableHTML = tableHTML.replace(/<thead>/, '<thead>' + titleRows);
+    }
+
+    var html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">' +
+      '<head><meta charset="UTF-8">' + styles +
+      '<!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet>' +
+      '<x:Name>Pivot</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions>' +
+      '</x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head><body>' +
+      '<table>' + tableHTML + '</table></body></html>';
+
+    var blob = new Blob([html], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+    triggerDownload(blob, (filename || 'pivot_table') + '.xls');
+  }
+
+  function triggerDownload(blob, filename) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 100);
+  }
+
+  // Bind download buttons on any pivot overlay
+  function bindDownloadButtons(overlayEl, componentName) {
+    var cfg = (componentName && typeof configCache !== 'undefined' && configCache[componentName]) ||
+              (componentName && typeof viewerConfigs !== 'undefined' && viewerConfigs[componentName]) ||
+              loadConfigLocal(componentName) || {};
+    var btns = overlayEl.querySelectorAll('.pivot-download-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].addEventListener('click', function (e) {
+        e.stopPropagation();
+        var fname = (cfg.titleAlias || componentName || 'pivot_table');
+        downloadPivotExcel(overlayEl, cfg, fname);
+      });
+    }
   }
 
   // ===================== RENDER PIVOT HTML =====================
@@ -1238,6 +1311,7 @@
           if (ft) ft.style.display = 'none';
           ov.style.display = 'flex';
           ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
+          bindDownloadButtons(ov, widgetName);
         };
 
         var showOverlayMsg = function (msg, isError) {
@@ -1422,6 +1496,7 @@
             if (_backendPivotCache[name]) {
               var ov = ensureOverlay();
               ov.innerHTML = _backendPivotCache[name].html;
+              bindDownloadButtons(ov, name);
               return;
             }
             // Fetch from backend (once, then cache)
@@ -1435,6 +1510,7 @@
                   if (extracted.data.length === 0) return;
                   var ov2 = ensureOverlay();
                   ov2.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config);
+                  bindDownloadButtons(ov2, name);
                 });
                 return;
               }
@@ -1451,6 +1527,7 @@
               _backendPivotCache[name] = { html: html, timestamp: Date.now() };
               var ov = ensureOverlay();
               ov.innerHTML = html;
+              bindDownloadButtons(ov, name);
             });
           } else {
             // Frontend pivot: extract from DOM
@@ -1458,6 +1535,7 @@
               if (extracted.data.length === 0) return;
               var ov = ensureOverlay();
               ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config);
+              bindDownloadButtons(ov, name);
             });
           }
         })(tables[i]);
@@ -1527,6 +1605,7 @@
 
         overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
         overlay.style.display = 'flex';
+        bindDownloadButtons(overlay, name);
       }
 
       function showLoading() {
@@ -1551,18 +1630,33 @@
       // ---- Backend Pivot: call server API directly ----
       if (config.backendPivot) {
         showLoading();
-        executePivotAsync(name, config, function (err, rows) {
-          if (err) {
-            // Fallback: try frontend pivot sources
-            console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
-            var fallbackData = getDataForPivot();
-            if (fallbackData.length > 0) {
-              renderPivot(fallbackData);
-            } else {
-              showError('No data available. Query may have been deleted.');
-            }
+
+        // Retry backend pivot (version ID might not be captured yet in viewer)
+        var backendAttempts = 0;
+        var maxBackendAttempts = 10;
+        function tryBackendPivot() {
+          backendAttempts++;
+          var vid = detectAppVersionId();
+          if (!vid && backendAttempts < maxBackendAttempts) {
+            setTimeout(tryBackendPivot, 1000);
             return;
           }
+          executePivotAsync(name, config, function (err, rows) {
+            if (err) {
+              if (backendAttempts < maxBackendAttempts && err.message && err.message.indexOf('version not detected') !== -1) {
+                setTimeout(tryBackendPivot, 1000);
+                return;
+              }
+              console.warn(LOG_PREFIX, 'Backend pivot failed:', err.message);
+              // Fallback: try frontend pivot sources
+              var fallbackData = getDataForPivot();
+              if (fallbackData.length > 0) {
+                renderPivot(fallbackData);
+              } else {
+                showError('No data available');
+              }
+              return;
+            }
           // Reshape: backend returns flat GROUP BY rows with _pivot_value
           var data = rows.map(function (row) {
             var r = {};
@@ -1575,7 +1669,9 @@
           });
           console.log(LOG_PREFIX, 'Backend pivot rendered:', name, data.length, 'rows');
           renderPivot(data);
-        });
+          });
+        }
+        tryBackendPivot();
         return;
       }
 

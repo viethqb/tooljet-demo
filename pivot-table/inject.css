@@ -431,9 +431,53 @@
 .pivot-title-bar {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   padding: 8px 12px 4px;
   flex-shrink: 0;
+}
+
+.pivot-toolbar {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pivot-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 5px;
+  background: var(--white, #fff);
+  color: var(--slate11, #687076);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.pivot-download-btn:hover {
+  background: var(--slate3, #f1f3f5);
+  border-color: var(--indigo9, #3e63dd);
+  color: var(--indigo9, #3e63dd);
+}
+
+.pivot-download-btn svg {
+  flex-shrink: 0;
+}
+
+.dark-theme .pivot-download-btn {
+  background: var(--slate3, #1a1d21);
+  border-color: var(--slate7, #333);
+  color: var(--slate8, #889096);
+}
+
+.dark-theme .pivot-download-btn:hover {
+  border-color: var(--indigo9, #3e63dd);
+  color: var(--indigo9, #3e63dd);
 }
 
 .pivot-title-text {
