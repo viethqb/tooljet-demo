@@ -1625,29 +1625,23 @@
                 backendCb.disabled = true;
               }
               if (backendInfo) backendInfo.textContent = 'Query: ' + (result.query_name || '?') + ' (' + result.kind + ')';
-              // Ensure config reflects forced-on state
+              // Ensure config has backendPivot=true and save to DB (fix old bad configs)
               var cfgOn = getConfig(widgetName);
               if (!cfgOn.backendPivot) {
                 cfgOn.backendPivot = true;
-                setConfig(widgetName, cfgOn);
+                setConfig(widgetName, cfgOn); // save to memory + localStorage + API
                 delete _backendPivotCache[widgetName];
                 if (cfgOn.enabled) updatePreview(widgetName, cfgOn);
               }
             } else {
-              // Not supported: force off, disable toggle, show reason
+              // Not supported: disable toggle UI, show reason
+              // Keep backendPivot: true in config — runtime fallback handles it
+              // (backend execute fail → automatic frontend pivot fallback)
               if (backendCb) {
                 backendCb.checked = false;
                 backendCb.disabled = true;
               }
               if (backendInfo) backendInfo.textContent = result.reason || 'Not supported';
-              // Update config to reflect forced-off state and re-render with frontend pivot
-              var cfg = getConfig(widgetName);
-              if (cfg.backendPivot) {
-                cfg.backendPivot = false;
-                setConfig(widgetName, cfg);
-                delete _backendPivotCache[widgetName];
-                if (cfg.enabled) updatePreview(widgetName, cfg);
-              }
             }
           })
           .catch(function () {});
@@ -1864,11 +1858,12 @@
           isRename = true;
           configCache[widgetName] = configCache[activeWidget];
           saveConfigLocal(widgetName, configCache[widgetName]);
-          // Save to API immediately + retry after 2s (ToolJet DB name update may lag)
+          // Save to API (creates row with new name in DB)
           saveConfig(widgetName, configCache[widgetName]);
-          setTimeout(function () {
-            if (configCache[widgetName]) saveConfig(widgetName, configCache[widgetName]);
-          }, 2000);
+          // Retry after 2s + 5s (ToolJet DB name commit may lag)
+          var _carryName = widgetName;
+          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName]); }, 2000);
+          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName]); }, 5000);
           console.log(LOG_PREFIX, 'Config carried:', activeWidget, '→', widgetName);
         }
 
