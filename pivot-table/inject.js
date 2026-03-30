@@ -256,6 +256,7 @@
       styleRowFields: 'bold', styleColValues: '', styleRowTotal: '',
       styleGrandTotal: 'bold', styleSubtotal: 'bold italic',
       emptyValue: '-',
+      decimalPlaces: 'auto', // 'auto' | 0 | 1 | 2 | 3 | 4 | 5 | 6
       pageSize: 0, // 0 = all
     };
   }
@@ -276,7 +277,7 @@
   const AGG = {
     count: { label: 'Count', fn: (v) => v.length },
     sum:   { label: 'Sum',   fn: (v) => v.reduce((a, b) => a + (parseFloat(b) || 0), 0) },
-    avg:   { label: 'Avg',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? (n.reduce((a, b) => a + b, 0) / n.length).toFixed(2) : 0; } },
+    avg:   { label: 'Avg',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? (n.reduce((a, b) => a + b, 0) / n.length) : 0; } },
     min:   { label: 'Min',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? Math.min(...n) : ''; } },
     max:   { label: 'Max',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? Math.max(...n) : ''; } },
   };
@@ -864,7 +865,7 @@
         sumProduct += wv * wc;
         sumCounts += wc;
       }
-      return sumCounts > 0 ? (sumProduct / sumCounts).toFixed(2) : 0;
+      return sumCounts > 0 ? (sumProduct / sumCounts) : 0;
     }
     // Store component name for pagination state lookup
     config._componentName = componentName || config._componentName || '';
@@ -900,6 +901,16 @@
     var sST = config.styleSubtotal || '';
     // Empty cell display
     var emptyVal = config.emptyValue !== undefined ? config.emptyValue : '0';
+
+    // Number formatter: apply configured decimal places
+    var dp = config.decimalPlaces;
+    function fmtNum(v) {
+      if (v === '' || v === null || v === undefined) return esc(emptyVal);
+      var n = parseFloat(v);
+      if (isNaN(n)) return esc(String(v));
+      if (dp === 'auto' || dp === undefined || dp === null || dp === '') return String(n);
+      return n.toFixed(parseInt(dp, 10));
+    }
 
     // Build inline style from alignment + text style string
     function sf(align, style) {
@@ -1019,12 +1030,12 @@
       if (showCols) {
         for (var cj = 0; cj < colValues.length; cj++) {
           var vals = rd.cells[colValues[cj]] || [];
-          r += '<td class="pivot-cell"' + sf(aVal, sVal) + '>' + (vals.length ? aggFn(vals) : esc(emptyVal)) + '</td>';
+          r += '<td class="pivot-cell"' + sf(aVal, sVal) + '>' + (vals.length ? fmtNum(aggFn(vals)) : esc(emptyVal)) + '</td>';
         }
       }
       if (showRowTotal) {
         var rtVal = (useWeightedAvg && countTree[rk]) ? weightedAvg(rd.values, countTree[rk].counts) : aggFn(rd.values);
-        r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + rtVal + '</td>';
+        r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + fmtNum(rtVal) + '</td>';
       }
       r += '</tr>';
       return r;
@@ -1045,7 +1056,7 @@
               for (var cv3 = 0; cv3 < cc2.length; cv3++) subCnts.push(cc2[cv3]);
             }
           }
-          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + (useWeightedAvg ? weightedAvg(subVals, subCnts) : aggFn(subVals)) + '</td>';
+          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtNum(useWeightedAvg ? weightedAvg(subVals, subCnts) : aggFn(subVals)) + '</td>';
         }
       }
       if (showRowTotal) {
@@ -1058,7 +1069,7 @@
             for (var st3 = 0; st3 < stc.length; st3++) subTotalCnts.push(stc[st3]);
           }
         }
-        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + (useWeightedAvg ? weightedAvg(subTotal, subTotalCnts) : aggFn(subTotal)) + '</td>';
+        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + fmtNum(useWeightedAvg ? weightedAvg(subTotal, subTotalCnts) : aggFn(subTotal)) + '</td>';
       }
       r += '</tr>';
       return r;
@@ -1136,7 +1147,7 @@
           }
           for (var ck = 0; ck < colValues.length; ck++) {
             var gtVal = gtMap[colValues[ck]];
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (gtVal !== undefined ? gtVal : esc(emptyVal)) + '</td>';
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (gtVal !== undefined ? fmtNum(gtVal) : esc(emptyVal)) + '</td>';
           }
         } else {
           // No column fields: server returns single overall total
@@ -1153,7 +1164,7 @@
               gtSumProd += gtv * gtc;
               gtSumCnt += gtc;
             }
-            gtDisplay = gtSumCnt > 0 ? (gtSumProd / gtSumCnt).toFixed(2) : 0;
+            gtDisplay = gtSumCnt > 0 ? (gtSumProd / gtSumCnt) : 0;
           } else {
             var gtSum = 0;
             for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
@@ -1161,7 +1172,7 @@
             }
             gtDisplay = gtSum;
           }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + gtDisplay + '</td>';
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + fmtNum(gtDisplay) + '</td>';
         }
       } else {
         // Frontend computation (non-paginated or no server grand totals)
@@ -1176,7 +1187,7 @@
                 for (var vi2 = 0; vi2 < ccv.length; vi2++) colTotalCnts.push(ccv[vi2]);
               }
             }
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (useWeightedAvg ? weightedAvg(colTotal, colTotalCnts) : aggFn(colTotal)) + '</td>';
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + fmtNum(useWeightedAvg ? weightedAvg(colTotal, colTotalCnts) : aggFn(colTotal)) + '</td>';
           }
         }
         if (showRowTotal) {
@@ -1189,7 +1200,7 @@
               for (var gcj = 0; gcj < gc.length; gcj++) grandCnts.push(gc[gcj]);
             }
           }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + (useWeightedAvg ? weightedAvg(grandVals, grandCnts) : aggFn(grandVals)) + '</td>';
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + fmtNum(useWeightedAvg ? weightedAvg(grandVals, grandCnts) : aggFn(grandVals)) + '</td>';
         }
       }
       h += '</tr>';
@@ -1447,6 +1458,18 @@
       h += '</select></div>';
 
       h += '<div class="pivot-section-label">Formatting</div>';
+
+      // Decimal places
+      h += '<div class="pivot-prop-row">';
+      h += '<label class="pivot-prop-label">Decimals</label>';
+      h += '<select class="pivot-cfg-select pivot-cfg-decimalPlaces">';
+      var dpOpts = [['auto', 'Auto'], ['0', '0'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6']];
+      var curDP = config.decimalPlaces !== undefined ? String(config.decimalPlaces) : 'auto';
+      for (var dpi = 0; dpi < dpOpts.length; dpi++) {
+        h += '<option value="' + dpOpts[dpi][0] + '"' + (curDP === dpOpts[dpi][0] ? ' selected' : '') + '>' + dpOpts[dpi][1] + '</option>';
+      }
+      h += '</select></div>';
+
       h += buildFormatRow('Row Fields', 'RowFields', config);
       h += buildFormatRow('Values', 'ColValues', config);
       h += buildFormatRow('Row Total', 'RowTotal', config);
@@ -1596,6 +1619,9 @@
       var emptySel = section.querySelector('.pivot-cfg-emptyValue');
       if (emptySel) config.emptyValue = emptySel.value;
 
+      var dpSel = section.querySelector('.pivot-cfg-decimalPlaces');
+      if (dpSel) config.decimalPlaces = dpSel.value === 'auto' ? 'auto' : dpSel.value;
+
       var pageSizeSel = section.querySelector('.pivot-cfg-pageSize');
       if (pageSizeSel) config.pageSize = parseInt(pageSizeSel.value, 10) || 0;
 
@@ -1685,7 +1711,7 @@
       }
 
       // Enable toggle + value field + aggregation
-      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue, .pivot-cfg-pageSize');
+      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue, .pivot-cfg-decimalPlaces, .pivot-cfg-pageSize');
       for (var i = 0; i < simpleInputs.length; i++) {
         simpleInputs[i].addEventListener('change', onConfigChange);
       }
