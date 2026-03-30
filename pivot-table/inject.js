@@ -250,8 +250,15 @@
       styleRowFields: 'bold', styleColValues: '', styleRowTotal: '',
       styleGrandTotal: 'bold', styleSubtotal: 'bold italic',
       emptyValue: '-',
+      pageSize: 0, // 0 = all (no pagination)
     };
   }
+
+  // ===================== PAGINATION STATE (runtime, not persisted) =====================
+  var _pivotPage = {}; // componentName -> current page (0-based)
+
+  function getPivotPage(name) { return _pivotPage[name] || 0; }
+  function setPivotPage(name, page) { _pivotPage[name] = page; }
 
   // ===================== AGGREGATORS =====================
   const AGG = {
@@ -410,10 +417,24 @@
       tree[rk].values.push(val);
     });
 
+    // Natural sort: numeric parts compared as numbers, rest as strings
+    function naturalCmp(a, b) {
+      var pa = a.split('\x00'), pb = b.split('\x00');
+      for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+        var va = pa[i] || '', vb = pb[i] || '';
+        var na = parseFloat(va), nb = parseFloat(vb);
+        var aIsNum = va !== '' && !isNaN(na) && isFinite(na) && String(na) === va.trim();
+        var bIsNum = vb !== '' && !isNaN(nb) && isFinite(nb) && String(nb) === vb.trim();
+        if (aIsNum && bIsNum) { if (na !== nb) return na - nb; }
+        else { if (va < vb) return -1; if (va > vb) return 1; }
+      }
+      return 0;
+    }
+
     return {
       tree: tree,
-      colValues: Array.from(colSet).sort(),
-      rowKeys: Object.keys(tree).sort(),
+      colValues: Array.from(colSet).sort(naturalCmp),
+      rowKeys: Object.keys(tree).sort(naturalCmp),
       rowFieldValues: rowFieldValues,
     };
   }
@@ -731,14 +752,38 @@
     }
   }
 
+  // Bind pagination buttons — re-renders pivot on page change
+  function bindPaginationButtons(overlayEl, componentName, data, config, tableEl) {
+    var btns = overlayEl.querySelectorAll('.pivot-page-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (this.disabled) return;
+        var page = parseInt(this.getAttribute('data-page'), 10);
+        if (isNaN(page) || page < 0) return;
+        setPivotPage(componentName, page);
+        // Re-render the overlay
+        overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, componentName);
+        bindDownloadButtons(overlayEl, componentName);
+        bindPaginationButtons(overlayEl, componentName, data, config, tableEl);
+        if (tableEl) adjustPivotHeight(tableEl, overlayEl);
+        // Scroll to top of pivot
+        var scroll = overlayEl.querySelector('.pivot-result-scroll');
+        if (scroll) scroll.scrollTop = 0;
+      });
+    }
+  }
+
   // ===================== RENDER PIVOT HTML =====================
-  function renderPivotHTML(data, config) {
+  function renderPivotHTML(data, config, componentName) {
     var result = computePivot(data, config);
     var tree = result.tree;
     var colValues = result.colValues;
     var rowKeys = result.rowKeys;
     var rowFieldValues = result.rowFieldValues;
     var aggFn = AGG[config.aggregator]?.fn || AGG.count.fn;
+    // Store component name for pagination state lookup
+    config._componentName = componentName || config._componentName || '';
 
     if (rowKeys.length === 0) {
       return '<div class="pivot-empty">No data to pivot. Ensure the table has loaded data.</div>';
@@ -923,12 +968,40 @@
       return r;
     }
 
+    // ---- PAGINATION ----
+    var pageSize = config.pageSize || 0; // 0 = all
+    var totalDataRows = rowKeys.length;
+    var totalPages = pageSize > 0 ? Math.ceil(totalDataRows / pageSize) : 1;
+    var currentPage = getPivotPage(config._componentName || '') || 0;
+    if (currentPage >= totalPages) currentPage = Math.max(0, totalPages - 1);
+
+    // Determine which row keys to show on this page
+    var pageRowKeys, pageRowGroups;
+    if (pageSize > 0) {
+      var startIdx = currentPage * pageSize;
+      var endIdx = Math.min(startIdx + pageSize, totalDataRows);
+      pageRowKeys = rowKeys.slice(startIdx, endIdx);
+
+      // Rebuild row groups for paginated keys (for subtotals)
+      if (showSubtotal) {
+        pageRowGroups = {};
+        for (var pri = 0; pri < pageRowKeys.length; pri++) {
+          var pFirstField = (rowFieldValues[pageRowKeys[pri]] || [''])[0];
+          if (!pageRowGroups[pFirstField]) pageRowGroups[pFirstField] = [];
+          pageRowGroups[pFirstField].push(pageRowKeys[pri]);
+        }
+      }
+    } else {
+      pageRowKeys = rowKeys;
+      pageRowGroups = rowGroups;
+    }
+
     // Data rows (with optional subtotals)
     if (showSubtotal) {
-      var groupOrder = Object.keys(rowGroups).sort();
+      var groupOrder = Object.keys(pageRowGroups).sort();
       for (var gIdx = 0; gIdx < groupOrder.length; gIdx++) {
         var gKey = groupOrder[gIdx];
-        var gRows = rowGroups[gKey];
+        var gRows = pageRowGroups[gKey];
         for (var gri = 0; gri < gRows.length; gri++) {
           h += renderRow(gRows[gri]);
         }
@@ -937,12 +1010,12 @@
         }
       }
     } else {
-      for (var ri = 0; ri < rowKeys.length; ri++) {
-        h += renderRow(rowKeys[ri]);
+      for (var ri = 0; ri < pageRowKeys.length; ri++) {
+        h += renderRow(pageRowKeys[ri]);
       }
     }
 
-    // Grand total row
+    // Grand total row (always computed from ALL rows, not just current page)
     if (showGrandTotal) {
       h += '<tr class="pivot-grand-total">';
       h += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aGT, sGT) + '>' + esc(grandTotalLabel) + '</td>';
@@ -968,6 +1041,19 @@
     }
 
     h += '</tbody></table></div>';
+
+    // Pagination bar (only if pageSize > 0 and more than 1 page)
+    if (pageSize > 0 && totalPages > 1) {
+      h += '<div class="pivot-pagination">';
+      h += '<span class="pivot-page-info">Page ' + (currentPage + 1) + ' of ' + totalPages + ' (' + totalDataRows + ' rows)</span>';
+      h += '<div class="pivot-page-btns">';
+      h += '<button class="pivot-page-btn pivot-page-first" ' + (currentPage === 0 ? 'disabled' : '') + ' data-page="0" title="First">&laquo;</button>';
+      h += '<button class="pivot-page-btn pivot-page-prev" ' + (currentPage === 0 ? 'disabled' : '') + ' data-page="' + (currentPage - 1) + '" title="Previous">&lsaquo;</button>';
+      h += '<button class="pivot-page-btn pivot-page-next" ' + (currentPage >= totalPages - 1 ? 'disabled' : '') + ' data-page="' + (currentPage + 1) + '" title="Next">&rsaquo;</button>';
+      h += '<button class="pivot-page-btn pivot-page-last" ' + (currentPage >= totalPages - 1 ? 'disabled' : '') + ' data-page="' + (totalPages - 1) + '" title="Last">&raquo;</button>';
+      h += '</div></div>';
+    }
+
     return h;
   }
 
@@ -1203,6 +1289,18 @@
       h += buildFormatRow('Grand Total', 'GrandTotal', config);
       h += buildFormatRow('Subtotals', 'Subtotal', config);
 
+      // Page Size
+      h += '<div class="pivot-section-label">Pagination</div>';
+      h += '<div class="pivot-prop-row">';
+      h += '<label class="pivot-prop-label">Page Size</label>';
+      h += '<select class="pivot-cfg-select pivot-cfg-pageSize">';
+      var pageSizes = [[0, 'All'], [10, '10'], [20, '20'], [50, '50'], [100, '100']];
+      var curPS = config.pageSize || 0;
+      for (var pi = 0; pi < pageSizes.length; pi++) {
+        h += '<option value="' + pageSizes[pi][0] + '"' + (curPS == pageSizes[pi][0] ? ' selected' : '') + '>' + pageSizes[pi][1] + '</option>';
+      }
+      h += '</select></div>';
+
       // Refresh columns button
       h += '<div class="pivot-prop-row">';
       h += '<button class="pivot-refresh-btn" type="button">Refresh Columns</button>';
@@ -1328,6 +1426,9 @@
       var emptySel = section.querySelector('.pivot-cfg-emptyValue');
       if (emptySel) config.emptyValue = emptySel.value;
 
+      var pageSizeSel = section.querySelector('.pivot-cfg-pageSize');
+      if (pageSizeSel) config.pageSize = parseInt(pageSizeSel.value, 10) || 0;
+
       // Read alignment from active buttons
       var alignKeys = ['alignRowFields', 'alignColValues', 'alignRowTotal', 'alignGrandTotal', 'alignSubtotal'];
       for (var ai = 0; ai < alignKeys.length; ai++) {
@@ -1380,6 +1481,9 @@
         setConfig(widgetName, config);
         console.log(LOG_PREFIX, 'Config saved for', widgetName, JSON.stringify(config));
 
+        // Reset page when config changes
+        setPivotPage(widgetName, 0);
+
         // Clear backend pivot cache so it re-fetches
         delete _backendPivotCache[widgetName];
 
@@ -1390,7 +1494,7 @@
       }
 
       // Enable toggle + value field + aggregation
-      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue');
+      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue, .pivot-cfg-pageSize');
       for (var i = 0; i < simpleInputs.length; i++) {
         simpleInputs[i].addEventListener('change', onConfigChange);
       }
@@ -1540,8 +1644,9 @@
           if (da) da.style.display = 'none';
           if (ft) ft.style.display = 'none';
           ov.style.display = 'flex';
-          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
+          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, widgetName);
           bindDownloadButtons(ov, widgetName);
+          bindPaginationButtons(ov, widgetName, data, config, tableEl);
           adjustPivotHeight(tableEl, ov);
         };
 
@@ -1723,11 +1828,12 @@
           }
 
           if (config.backendPivot) {
-            // Use cached HTML if available (avoid repeated API calls)
-            if (_backendPivotCache[name]) {
+            // Use cached data if available (avoid repeated API calls)
+            if (_backendPivotCache[name] && _backendPivotCache[name].data) {
               var ov = ensureOverlay();
-              ov.innerHTML = _backendPivotCache[name].html;
+              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(_backendPivotCache[name].data, config, name);
               bindDownloadButtons(ov, name);
+              bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
               return;
             }
             // Fetch from backend (once, then cache)
@@ -1740,8 +1846,9 @@
                 extractDataAsync(tableEl, function (extracted) {
                   if (extracted.data.length === 0) return;
                   var ov2 = ensureOverlay();
-                  ov2.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config);
+                  ov2.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config, name);
                   bindDownloadButtons(ov2, name);
+                  bindPaginationButtons(ov2, name, extracted.data, config, tableEl);
                 });
                 return;
               }
@@ -1754,19 +1861,20 @@
                 r[config.valueField || '_count'] = row['_pivot_value'];
                 return r;
               });
-              var html = buildTitleHTML(config) + renderPivotHTML(data, config);
-              _backendPivotCache[name] = { html: html, timestamp: Date.now() };
+              _backendPivotCache[name] = { data: data, timestamp: Date.now() };
               var ov = ensureOverlay();
-              ov.innerHTML = html;
+              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name);
               bindDownloadButtons(ov, name);
+              bindPaginationButtons(ov, name, data, config, tableEl);
             });
           } else {
             // Frontend pivot: extract from DOM
             extractDataAsync(tableEl, function (extracted) {
               if (extracted.data.length === 0) return;
               var ov = ensureOverlay();
-              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config);
+              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config, name);
               bindDownloadButtons(ov, name);
+              bindPaginationButtons(ov, name, extracted.data, config, tableEl);
             });
           }
         })(tables[i]);
@@ -1834,9 +1942,10 @@
           else tableEl.appendChild(overlay);
         }
 
-        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config);
+        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name);
         overlay.style.display = 'flex';
         bindDownloadButtons(overlay, name);
+        bindPaginationButtons(overlay, name, data, config, tableEl);
         adjustPivotHeight(tableEl, overlay);
       }
 

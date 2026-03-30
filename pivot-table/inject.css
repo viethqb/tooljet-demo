@@ -504,6 +504,75 @@
 }
 
 /* =====================================================================
+   PAGINATION BAR
+   ===================================================================== */
+
+.pivot-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--cc-default-border, #e6e8eb);
+  flex-shrink: 0;
+}
+
+.pivot-page-info {
+  font-size: 11px;
+  color: var(--slate9, #889096);
+  white-space: nowrap;
+}
+
+.pivot-page-btns {
+  display: flex;
+  gap: 2px;
+}
+
+.pivot-page-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 4px;
+  background: var(--white, #fff);
+  color: var(--slate11, #687076);
+  cursor: pointer;
+  transition: all 0.15s;
+  line-height: 1;
+}
+
+.pivot-page-btn:hover:not(:disabled) {
+  background: var(--slate3, #f1f3f5);
+  border-color: var(--indigo9, #3e63dd);
+  color: var(--indigo9, #3e63dd);
+}
+
+.pivot-page-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.dark-theme .pivot-pagination {
+  border-color: var(--slate7, #333);
+}
+
+.dark-theme .pivot-page-btn {
+  background: var(--slate3, #1a1d21);
+  border-color: var(--slate7, #333);
+  color: var(--slate8, #889096);
+}
+
+.dark-theme .pivot-page-btn:hover:not(:disabled) {
+  border-color: var(--indigo9, #3e63dd);
+  color: var(--indigo9, #3e63dd);
+}
+
+/* =====================================================================
    DARK THEME
    ===================================================================== */
 
