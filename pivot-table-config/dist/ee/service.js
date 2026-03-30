@@ -500,6 +500,7 @@ let PivotTableConfigService = class PivotTableConfigService {
             } else {
                 selectParts.push(aggFunc + '(' + escId(valueField) + ') AS `_pivot_value`');
             }
+            selectParts.push('COUNT(*) AS `_pivot_count`'); // for weighted avg grand total
             var groupBy = colFields.map(function (f) { return escId(f); });
 
             return 'SELECT ' + selectParts.join(', ') + '\n' +

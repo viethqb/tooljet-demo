@@ -419,6 +419,7 @@
 
     var colSet = new Set();
     var tree = {};
+    var countTree = {}; // parallel to tree — stores _pivot_count for weighted avg
     var rowFieldValues = {}; // rowKey -> [val1, val2, ...]
 
     data.forEach(function (row) {
@@ -432,9 +433,19 @@
       if (!tree[rk]) { tree[rk] = { cells: {}, values: [] }; rowFieldValues[rk] = rowParts; }
       if (!tree[rk].cells[ck]) tree[rk].cells[ck] = [];
 
-      var val = valueField ? row[valueField] : '1';
+      var val = valueField ? row[valueField] : (row['_count'] !== undefined ? row['_count'] : '1');
       tree[rk].cells[ck].push(val);
       tree[rk].values.push(val);
+
+      // Track counts for weighted avg (backend pivot rows have _pivot_count)
+      var cnt = row['_pivot_count'];
+      if (cnt !== undefined) {
+        if (!countTree[rk]) countTree[rk] = { cells: {}, counts: [] };
+        if (!countTree[rk].cells[ck]) countTree[rk].cells[ck] = [];
+        var cntNum = parseFloat(cnt) || 0;
+        countTree[rk].cells[ck].push(cntNum);
+        countTree[rk].counts.push(cntNum);
+      }
     });
 
     // Natural sort: numeric parts compared as numbers, rest as strings
@@ -453,6 +464,7 @@
 
     return {
       tree: tree,
+      countTree: countTree,
       colValues: Array.from(colSet).sort(naturalCmp),
       rowKeys: Object.keys(tree).sort(naturalCmp),
       rowFieldValues: rowFieldValues,
@@ -797,12 +809,13 @@
             var pData = rows.map(function (row) {
               var r = {};
               for (var k in row) {
-                if (k === '_pivot_value' || k === '_pivot_count') continue;
+                if (k === '_pivot_value') continue;
                 r[k] = row[k];
               }
               r[config.valueField || '_count'] = row['_pivot_value'];
               return r;
             });
+            pData._isBackend = true;
             overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals);
             bindDownloadButtons(overlayEl, componentName);
             bindPaginationButtons(overlayEl, componentName, pData, config, tableEl, total);
@@ -829,10 +842,30 @@
   function renderPivotHTML(data, config, componentName, serverTotal, serverGrandTotals) {
     var result = computePivot(data, config);
     var tree = result.tree;
+    var countTree = result.countTree;
     var colValues = result.colValues;
     var rowKeys = result.rowKeys;
     var rowFieldValues = result.rowFieldValues;
     var aggFn = AGG[config.aggregator]?.fn || AGG.count.fn;
+    var isBackend = serverTotal != null || data._isBackend;
+    // Backend pivot returns pre-aggregated values — count becomes sum of pre-counted values
+    if (isBackend && config.aggregator === 'count') {
+      aggFn = AGG.sum.fn;
+    }
+    // Weighted average helper for backend pre-aggregated avg data
+    var hasCountTree = Object.keys(countTree).length > 0;
+    var useWeightedAvg = isBackend && config.aggregator === 'avg' && hasCountTree;
+    function weightedAvg(values, counts) {
+      if (!counts || counts.length !== values.length) return aggFn(values);
+      var sumProduct = 0, sumCounts = 0;
+      for (var wi = 0; wi < values.length; wi++) {
+        var wv = parseFloat(values[wi]) || 0;
+        var wc = parseFloat(counts[wi]) || 0;
+        sumProduct += wv * wc;
+        sumCounts += wc;
+      }
+      return sumCounts > 0 ? (sumProduct / sumCounts).toFixed(2) : 0;
+    }
     // Store component name for pagination state lookup
     config._componentName = componentName || config._componentName || '';
     var _serverTotal = serverTotal; // null = frontend paging, number = backend paging
@@ -843,13 +876,13 @@
 
     var rowFields = config.rowFields;
     var colFields = config.colFields;
-    var showRowTotal = config.showRowTotal !== false;
+    var showCols = colValues.length > 0;
+    var showRowTotal = config.showRowTotal !== false || !showCols; // force on when no column fields
     var rowTotalLabel = config.rowTotalLabel || 'Total';
     var showGrandTotal = config.showGrandTotal !== false;
     var grandTotalLabel = config.grandTotalLabel || 'Grand Total';
     var showSubtotal = config.showSubtotal && rowFields.length > 1;
     var subtotalLabel = config.subtotalLabel || 'Subtotal';
-    var showCols = colValues.length > 0;
     var numRowCols = rowFields.length || 1;
     var numColFields = colFields.length || 0;
 
@@ -989,7 +1022,10 @@
           r += '<td class="pivot-cell"' + sf(aVal, sVal) + '>' + (vals.length ? aggFn(vals) : esc(emptyVal)) + '</td>';
         }
       }
-      if (showRowTotal) r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + aggFn(rd.values) + '</td>';
+      if (showRowTotal) {
+        var rtVal = (useWeightedAvg && countTree[rk]) ? weightedAvg(rd.values, countTree[rk].counts) : aggFn(rd.values);
+        r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + rtVal + '</td>';
+      }
       r += '</tr>';
       return r;
     }
@@ -1000,21 +1036,29 @@
       r += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aST, sST) + '>' + esc(subtotalLabel) + '</td>';
       if (showCols) {
         for (var sc = 0; sc < colValues.length; sc++) {
-          var subVals = [];
+          var subVals = [], subCnts = [];
           for (var sg = 0; sg < groupKeys.length; sg++) {
             var cv2 = tree[groupKeys[sg]].cells[colValues[sc]] || [];
             for (var sv = 0; sv < cv2.length; sv++) subVals.push(cv2[sv]);
+            if (useWeightedAvg && countTree[groupKeys[sg]] && countTree[groupKeys[sg]].cells[colValues[sc]]) {
+              var cc2 = countTree[groupKeys[sg]].cells[colValues[sc]];
+              for (var cv3 = 0; cv3 < cc2.length; cv3++) subCnts.push(cc2[cv3]);
+            }
           }
-          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + aggFn(subVals) + '</td>';
+          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + (useWeightedAvg ? weightedAvg(subVals, subCnts) : aggFn(subVals)) + '</td>';
         }
       }
       if (showRowTotal) {
-        var subTotal = [];
+        var subTotal = [], subTotalCnts = [];
         for (var st = 0; st < groupKeys.length; st++) {
           var stv = tree[groupKeys[st]].values;
           for (var st2 = 0; st2 < stv.length; st2++) subTotal.push(stv[st2]);
+          if (useWeightedAvg && countTree[groupKeys[st]]) {
+            var stc = countTree[groupKeys[st]].counts;
+            for (var st3 = 0; st3 < stc.length; st3++) subTotalCnts.push(stc[st3]);
+          }
         }
-        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + aggFn(subTotal) + '</td>';
+        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + (useWeightedAvg ? weightedAvg(subTotal, subTotalCnts) : aggFn(subTotal)) + '</td>';
       }
       r += '</tr>';
       return r;
@@ -1099,32 +1143,53 @@
           // (handled by showRowTotal below)
         }
         if (showRowTotal) {
-          // Overall total: sum all grand total values
-          var gtSum = 0;
-          for (var gts = 0; gts < serverGrandTotals.length; gts++) {
-            gtSum += parseFloat(serverGrandTotals[gts]._pivot_value) || 0;
+          // Overall total: for avg use weighted average, for others sum
+          var gtDisplay;
+          if (config.aggregator === 'avg') {
+            var gtSumProd = 0, gtSumCnt = 0;
+            for (var gts = 0; gts < serverGrandTotals.length; gts++) {
+              var gtv = parseFloat(serverGrandTotals[gts]._pivot_value) || 0;
+              var gtc = parseFloat(serverGrandTotals[gts]._pivot_count) || 0;
+              gtSumProd += gtv * gtc;
+              gtSumCnt += gtc;
+            }
+            gtDisplay = gtSumCnt > 0 ? (gtSumProd / gtSumCnt).toFixed(2) : 0;
+          } else {
+            var gtSum = 0;
+            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
+              gtSum += parseFloat(serverGrandTotals[gts2]._pivot_value) || 0;
+            }
+            gtDisplay = gtSum;
           }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + gtSum + '</td>';
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + gtDisplay + '</td>';
         }
       } else {
         // Frontend computation (non-paginated or no server grand totals)
         if (showCols) {
           for (var ck = 0; ck < colValues.length; ck++) {
-            var colTotal = [];
+            var colTotal = [], colTotalCnts = [];
             for (var rri = 0; rri < rowKeys.length; rri++) {
               var cv = tree[rowKeys[rri]].cells[colValues[ck]] || [];
               for (var vi = 0; vi < cv.length; vi++) colTotal.push(cv[vi]);
+              if (useWeightedAvg && countTree[rowKeys[rri]] && countTree[rowKeys[rri]].cells[colValues[ck]]) {
+                var ccv = countTree[rowKeys[rri]].cells[colValues[ck]];
+                for (var vi2 = 0; vi2 < ccv.length; vi2++) colTotalCnts.push(ccv[vi2]);
+              }
             }
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + aggFn(colTotal) + '</td>';
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (useWeightedAvg ? weightedAvg(colTotal, colTotalCnts) : aggFn(colTotal)) + '</td>';
           }
         }
         if (showRowTotal) {
-          var grandVals = [];
+          var grandVals = [], grandCnts = [];
           for (var gvi = 0; gvi < rowKeys.length; gvi++) {
             var gv = tree[rowKeys[gvi]].values;
             for (var gvj = 0; gvj < gv.length; gvj++) grandVals.push(gv[gvj]);
+            if (useWeightedAvg && countTree[rowKeys[gvi]]) {
+              var gc = countTree[rowKeys[gvi]].counts;
+              for (var gcj = 0; gcj < gc.length; gcj++) grandCnts.push(gc[gcj]);
+            }
           }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + aggFn(grandVals) + '</td>';
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + (useWeightedAvg ? weightedAvg(grandVals, grandCnts) : aggFn(grandVals)) + '</td>';
         }
       }
       h += '</tr>';
@@ -1290,13 +1355,15 @@
       h += buildOrderedPicker('colFields', config.colFields);
       h += '</div>';
 
-      // Value Field
+      // Value Field (excludes fields already used in Row/Column Fields)
+      var usedFields = (config.rowFields || []).concat(config.colFields || []);
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Value Field</label>';
       h += '<select class="pivot-cfg-select pivot-cfg-valueField">';
       h += '<option value="">(Count rows)</option>';
       for (var i = 0; i < cachedColumns.length; i++) {
         var c = cachedColumns[i];
+        if (usedFields.indexOf(c) !== -1) continue; // skip fields used in row/col
         h += '<option value="' + esc(c) + '"' + (config.valueField === c ? ' selected' : '') + '>' + esc(c) + '</option>';
       }
       h += '</select></div>';
@@ -1488,6 +1555,12 @@
 
       var valSel = section.querySelector('.pivot-cfg-valueField');
       if (valSel) config.valueField = valSel.value;
+      // Clear valueField if it conflicts with row/col fields
+      var allGroupFields = config.rowFields.concat(config.colFields);
+      if (config.valueField && allGroupFields.indexOf(config.valueField) !== -1) {
+        config.valueField = '';
+        if (valSel) valSel.value = '';
+      }
 
       var aggSel = section.querySelector('.pivot-cfg-aggregator');
       if (aggSel) config.aggregator = aggSel.value;
@@ -1565,6 +1638,26 @@
         }
       }
       sel.innerHTML = oh;
+    }
+
+    // Rebuild the Value Field dropdown (exclude fields used in Row/Column Fields)
+    function rebuildValueFieldDropdown(section, config) {
+      var valSel = section.querySelector('.pivot-cfg-valueField');
+      if (!valSel) return;
+      var used = (config.rowFields || []).concat(config.colFields || []);
+      var currentVal = config.valueField || '';
+      // If current valueField is now in row/col, clear it
+      if (currentVal && used.indexOf(currentVal) !== -1) {
+        currentVal = '';
+        config.valueField = '';
+      }
+      var oh = '<option value="">(Count rows)</option>';
+      for (var j = 0; j < cachedColumns.length; j++) {
+        var c = cachedColumns[j];
+        if (used.indexOf(c) !== -1) continue;
+        oh += '<option value="' + esc(c) + '"' + (currentVal === c ? ' selected' : '') + '>' + esc(c) + '</option>';
+      }
+      valSel.innerHTML = oh;
     }
 
     // ---- BIND EVENTS ----
@@ -1701,6 +1794,7 @@
 
           // Update UI
           rebuildPicker(section, zone, arr, widgetName);
+          rebuildValueFieldDropdown(section, config);
           updatePreview(widgetName, config);
         });
       }
@@ -1721,6 +1815,7 @@
         setConfig(widgetName, config);
 
         rebuildPicker(section, zone, arr, widgetName);
+        rebuildValueFieldDropdown(section, config);
         updatePreview(widgetName, config);
       });
 
@@ -1799,12 +1894,13 @@
             var data = rows.map(function (row) {
               var r = {};
               for (var k in row) {
-                if (k === '_pivot_value' || k === '_pivot_count') continue;
+                if (k === '_pivot_value') continue;
                 r[k] = row[k];
               }
               r[config.valueField || '_count'] = row['_pivot_value'];
               return r;
             });
+            data._isBackend = true;
             renderIntoOverlay(data, total, grandTotals);
           }, bpPage, bpPageSize);
         } else {
@@ -2028,12 +2124,13 @@
               var data = rows.map(function (row) {
                 var r = {};
                 for (var k in row) {
-                  if (k === '_pivot_value' || k === '_pivot_count') continue;
+                  if (k === '_pivot_value') continue;
                   r[k] = row[k];
                 }
                 r[config.valueField || '_count'] = row['_pivot_value'];
                 return r;
               });
+              data._isBackend = true;
               if (!kPageSize) _backendPivotCache[name] = { data: data, timestamp: Date.now() };
               var ov = ensureOverlay();
               ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, total, grandTotals);
@@ -2178,12 +2275,13 @@
           var data = rows.map(function (row) {
             var r = {};
             for (var k in row) {
-              if (k === '_pivot_value' || k === '_pivot_count') continue;
+              if (k === '_pivot_value') continue;
               r[k] = row[k];
             }
             r[config.valueField || '_count'] = row['_pivot_value'];
             return r;
           });
+          data._isBackend = true;
           console.log(LOG_PREFIX, 'Backend pivot rendered:', name, data.length, 'rows', 'total:', total);
           renderPivot(data, total, grandTotals);
           }, vPage, vPageSize);
