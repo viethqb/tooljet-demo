@@ -23,8 +23,8 @@ let QueryFoldersController = class QueryFoldersController {
     constructor(queryFoldersService) {
         this.queryFoldersService = queryFoldersService;
     }
-    async getQueryFolderMap(appVersionId) {
-        return this.queryFoldersService.getQueryFolderMap(appVersionId);
+    async getQueryFolderMap(user, appVersionId) {
+        return this.queryFoldersService.getQueryFolderMap(user, appVersionId);
     }
     async getFolders(user, appVersionId) {
         return this.queryFoldersService.getFolders(user, appVersionId);
@@ -43,11 +43,11 @@ let QueryFoldersController = class QueryFoldersController {
     async ensureDefaultFolder(user, appVersionId) {
         return this.queryFoldersService.ensureDefaultFolder(user, appVersionId);
     }
-    async moveQuery(dto) {
-        return this.queryFoldersService.moveQuery(dto.query_id, dto.folder_id || null);
+    async moveQuery(user, dto) {
+        return this.queryFoldersService.moveQuery(user, dto.query_id, dto.folder_id || null);
     }
-    async moveQueriesBulk(dto) {
-        return this.queryFoldersService.moveQueriesBulk(dto.query_ids, dto.folder_id || null);
+    async moveQueriesBulk(user, dto) {
+        return this.queryFoldersService.moveQueriesBulk(user, dto.query_ids, dto.folder_id || null);
     }
     async updateFolder(user, id, dto) {
         try {
@@ -70,9 +70,10 @@ let QueryFoldersController = class QueryFoldersController {
 __decorate([
     (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
     (0, common_1.Get)('queries/:appVersionId'),
-    __param(0, (0, common_1.Param)('appVersionId')),
+    __param(0, (0, user_decorator_1.User)()),
+    __param(1, (0, common_1.Param)('appVersionId')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String]),
+    __metadata("design:paramtypes", [Object, String]),
     __metadata("design:returntype", Promise)
 ], QueryFoldersController.prototype, "getQueryFolderMap", null);
 __decorate([
@@ -105,17 +106,19 @@ __decorate([
 __decorate([
     (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
     (0, common_1.Put)('move-query'),
-    __param(0, (0, common_1.Body)()),
+    __param(0, (0, user_decorator_1.User)()),
+    __param(1, (0, common_1.Body)()),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [dto_1.MoveQueryDto]),
+    __metadata("design:paramtypes", [Object, dto_1.MoveQueryDto]),
     __metadata("design:returntype", Promise)
 ], QueryFoldersController.prototype, "moveQuery", null);
 __decorate([
     (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
     (0, common_1.Put)('move-queries-bulk'),
-    __param(0, (0, common_1.Body)()),
+    __param(0, (0, user_decorator_1.User)()),
+    __param(1, (0, common_1.Body)()),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [dto_1.MoveQueriesBulkDto]),
+    __metadata("design:paramtypes", [Object, dto_1.MoveQueriesBulkDto]),
     __metadata("design:returntype", Promise)
 ], QueryFoldersController.prototype, "moveQueriesBulk", null);
 __decorate([

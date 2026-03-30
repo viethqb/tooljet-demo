@@ -620,13 +620,13 @@
     });
 
     const buttonsHtml = buttons
-      .map((btn, i) => `<button class="${btn.class}" data-btn-idx="${i}">${btn.text}</button>`)
+      .map((btn, i) => `<button class="${escapeHtml(btn.class)}" data-btn-idx="${i}">${escapeHtml(btn.text)}</button>`)
       .join('');
 
     overlay.innerHTML = `
       <div class="qf-modal">
         <div class="qf-modal-header">
-          <h3 class="qf-modal-title">${title}</h3>
+          <h3 class="qf-modal-title">${escapeHtml(title)}</h3>
           <button class="qf-modal-close" data-btn-close="true">${ICONS.close}</button>
         </div>
         <div class="qf-modal-body">${bodyHtml}</div>

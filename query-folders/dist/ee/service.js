@@ -11,8 +11,27 @@ const common_1 = require("@nestjs/common");
 const database_helper_1 = require("../../src/helpers/database.helper");
 
 let QueryFoldersService = class QueryFoldersService {
+
+    // Verify user's organization owns this app_version_id
+    async _verifyAccess(manager, user, appVersionId) {
+        if (!user || !user.organizationId) {
+            throw new common_1.HttpException('Unauthorized', common_1.HttpStatus.UNAUTHORIZED);
+        }
+        const rows = await manager.query(
+            `SELECT av.id FROM app_versions av
+             JOIN apps a ON av.app_id = a.id
+             WHERE av.id = $1 AND a.organization_id = $2
+             LIMIT 1`,
+            [appVersionId, user.organizationId]
+        );
+        if (rows.length === 0) {
+            throw new common_1.HttpException('App version not found', common_1.HttpStatus.NOT_FOUND);
+        }
+    }
+
     async getFolders(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
             const orgId = user.organizationId;
             const folders = await manager.query(
                 `SELECT qf.*,
@@ -26,8 +45,9 @@ let QueryFoldersService = class QueryFoldersService {
         });
     }
 
-    async getQueryFolderMap(appVersionId) {
+    async getQueryFolderMap(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
             const queries = await manager.query(
                 `SELECT id, name, folder_id FROM data_queries
                  WHERE app_version_id = $1
@@ -40,6 +60,7 @@ let QueryFoldersService = class QueryFoldersService {
 
     async createFolder(user, dto) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, dto.app_version_id);
             const orgId = user.organizationId;
             const result = await manager.query(
                 `INSERT INTO query_folders (name, parent_id, app_version_id, organization_id)
@@ -54,13 +75,29 @@ let QueryFoldersService = class QueryFoldersService {
     async updateFolder(user, id, dto) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             const orgId = user.organizationId;
+            // Verify folder belongs to user's org
+            const owned = await manager.query(
+                `SELECT id, app_version_id FROM query_folders WHERE id = $1 AND organization_id = $2`,
+                [id, orgId]
+            );
+            if (owned.length === 0) {
+                throw new common_1.HttpException('Folder not found', common_1.HttpStatus.NOT_FOUND);
+            }
             if (dto.parent_id === id) {
-                throw new Error('A folder cannot be its own parent');
+                throw new common_1.HttpException('A folder cannot be its own parent', common_1.HttpStatus.BAD_REQUEST);
             }
             if (dto.parent_id) {
-                const descendants = await this.getDescendantIds(manager, id);
+                // Verify parent belongs to same org and same app_version
+                const parent = await manager.query(
+                    `SELECT id FROM query_folders WHERE id = $1 AND organization_id = $2 AND app_version_id = $3`,
+                    [dto.parent_id, orgId, owned[0].app_version_id]
+                );
+                if (parent.length === 0) {
+                    throw new common_1.HttpException('Parent folder not found', common_1.HttpStatus.NOT_FOUND);
+                }
+                const descendants = await this.getDescendantIds(manager, id, orgId);
                 if (descendants.includes(dto.parent_id)) {
-                    throw new Error('Cannot move a folder into its own descendant');
+                    throw new common_1.HttpException('Cannot move a folder into its own descendant', common_1.HttpStatus.BAD_REQUEST);
                 }
             }
             const result = await manager.query(
@@ -80,23 +117,56 @@ let QueryFoldersService = class QueryFoldersService {
     async deleteFolder(user, id) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             const orgId = user.organizationId;
-            const descendantIds = await this.getDescendantIds(manager, id);
+            // Verify folder belongs to user's org
+            const owned = await manager.query(
+                `SELECT id FROM query_folders WHERE id = $1 AND organization_id = $2`,
+                [id, orgId]
+            );
+            if (owned.length === 0) {
+                throw new common_1.HttpException('Folder not found', common_1.HttpStatus.NOT_FOUND);
+            }
+            // Scope descendants to same org
+            const descendantIds = await this.getDescendantIds(manager, id, orgId);
             const allIds = [id, ...descendantIds];
             const placeholders = allIds.map((_, i) => `$${i + 1}`).join(',');
             await manager.query(
                 `UPDATE data_queries SET folder_id = NULL WHERE folder_id IN (${placeholders})`,
                 allIds
             );
+            // Delete folder and descendants scoped to org
+            const delPlaceholders = allIds.map((_, i) => `$${i + 1}`).join(',');
             await manager.query(
-                'DELETE FROM query_folders WHERE id = $1 AND organization_id = $2',
-                [id, orgId]
+                `DELETE FROM query_folders WHERE id IN (${delPlaceholders}) AND organization_id = $${allIds.length + 1}`,
+                [...allIds, orgId]
             );
             return { success: true };
         });
     }
 
-    async moveQuery(queryId, folderId) {
+    async moveQuery(user, queryId, folderId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            const orgId = user.organizationId;
+            // Verify query belongs to user's org (via app_version → apps)
+            const q = await manager.query(
+                `SELECT dq.id FROM data_queries dq
+                 JOIN app_versions av ON dq.app_version_id = av.id
+                 JOIN apps a ON av.app_id = a.id
+                 WHERE dq.id = $1 AND a.organization_id = $2`,
+                [queryId, orgId]
+            );
+            if (q.length === 0) {
+                throw new common_1.HttpException('Query not found', common_1.HttpStatus.NOT_FOUND);
+            }
+            // If folderId provided, verify it belongs to same org
+            if (folderId) {
+                const f = await manager.query(
+                    `SELECT id FROM query_folders WHERE id = $1 AND organization_id = $2`,
+                    [folderId, orgId]
+                );
+                if (f.length === 0) {
+                    throw new common_1.HttpException('Folder not found', common_1.HttpStatus.NOT_FOUND);
+                }
+            }
             await manager.query('UPDATE data_queries SET folder_id = $1 WHERE id = $2', [
                 folderId || null,
                 queryId,
@@ -105,8 +175,30 @@ let QueryFoldersService = class QueryFoldersService {
         });
     }
 
-    async moveQueriesBulk(queryIds, folderId) {
+    async moveQueriesBulk(user, queryIds, folderId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            const orgId = user.organizationId;
+            // Verify all queries belong to user's org
+            const qPlaceholders = queryIds.map((_, i) => `$${i + 1}`).join(',');
+            const q = await manager.query(
+                `SELECT dq.id FROM data_queries dq
+                 JOIN app_versions av ON dq.app_version_id = av.id
+                 JOIN apps a ON av.app_id = a.id
+                 WHERE dq.id IN (${qPlaceholders}) AND a.organization_id = $${queryIds.length + 1}`,
+                [...queryIds, orgId]
+            );
+            if (q.length !== queryIds.length) {
+                throw new common_1.HttpException('Some queries not found', common_1.HttpStatus.NOT_FOUND);
+            }
+            if (folderId) {
+                const f = await manager.query(
+                    `SELECT id FROM query_folders WHERE id = $1 AND organization_id = $2`,
+                    [folderId, orgId]
+                );
+                if (f.length === 0) {
+                    throw new common_1.HttpException('Folder not found', common_1.HttpStatus.NOT_FOUND);
+                }
+            }
             const placeholders = queryIds.map((_, i) => `$${i + 2}`).join(',');
             await manager.query(
                 `UPDATE data_queries SET folder_id = $1 WHERE id IN (${placeholders})`,
@@ -118,6 +210,7 @@ let QueryFoldersService = class QueryFoldersService {
 
     async ensureDefaultFolder(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
             const orgId = user.organizationId;
 
             // Check if this version already has folders
@@ -234,16 +327,22 @@ let QueryFoldersService = class QueryFoldersService {
         return true;
     }
 
-    async getDescendantIds(manager, folderId) {
+    async getDescendantIds(manager, folderId, orgId) {
+        const params = [folderId];
+        let orgFilter = '';
+        if (orgId) {
+            orgFilter = ' AND organization_id = $2';
+            params.push(orgId);
+        }
         const result = await manager.query(
             `WITH RECURSIVE descendants AS (
-                SELECT id FROM query_folders WHERE parent_id = $1
+                SELECT id FROM query_folders WHERE parent_id = $1${orgFilter}
                 UNION ALL
                 SELECT qf.id FROM query_folders qf
                 INNER JOIN descendants d ON qf.parent_id = d.id
             )
             SELECT id FROM descendants`,
-            [folderId]
+            params
         );
         return result.map((r) => r.id);
     }
