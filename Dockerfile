@@ -39,6 +39,7 @@ RUN chmod +x /app/query-folders/entrypoint.sh
 COPY pivot-table-config/dist/module.js /app/server/dist/src/modules/pivot-table-config/module.js
 COPY pivot-table-config/dist/ee/ /app/server/dist/ee/pivot-table-config/
 COPY pivot-table-config/dist/migrations/1760100000000-CreatePivotTableConfig.js /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js
+COPY pivot-table-config/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js /app/server/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js
 
 COPY pivot-table-config/patch-app-module.js /tmp/patch-app-module.js
 RUN node /tmp/patch-app-module.js && rm /tmp/patch-app-module.js
@@ -56,6 +57,7 @@ RUN chown -R appuser:0 /app/server/dist/ee/licensing/configs/License.js && \
     chown -R appuser:0 /app/server/dist/src/modules/pivot-table-config/ && \
     chown -R appuser:0 /app/server/dist/ee/pivot-table-config/ && \
     chown -R appuser:0 /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js && \
+    chown -R appuser:0 /app/server/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js && \
     chown -R appuser:0 /app/query-folders/ && \
     chown -R appuser:0 /app/pivot-table/
 

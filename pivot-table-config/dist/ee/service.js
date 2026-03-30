@@ -57,39 +57,90 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== CONFIG CRUD =====================
 
+    // Resolve component name → component UUID (from components table)
+    async _resolveComponentId(manager, appVersionId, componentName) {
+        var rows = await manager.query(
+            `SELECT c.id FROM components c
+             JOIN pages p ON c.page_id = p.id
+             WHERE p.app_version_id = $1 AND c.name = $2
+             LIMIT 1`,
+            [appVersionId, componentName]
+        );
+        return rows.length > 0 ? rows[0].id : null;
+    }
+
     async getConfig(appVersionId, componentName) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
-            var rows = await manager.query(
-                `SELECT config FROM pivot_table_configs WHERE app_version_id = $1 AND component_name = $2`,
-                [appVersionId, componentName]
-            );
+            var compId = await this._resolveComponentId(manager, appVersionId, componentName);
+
+            // Try by component_id first, fallback to component_name (backward compat)
+            var rows = [];
+            if (compId) {
+                rows = await manager.query(
+                    `SELECT config FROM pivot_table_configs WHERE app_version_id = $1 AND component_id = $2`,
+                    [appVersionId, compId]
+                );
+            }
+            if (rows.length === 0) {
+                rows = await manager.query(
+                    `SELECT config FROM pivot_table_configs WHERE app_version_id = $1 AND component_name = $2`,
+                    [appVersionId, componentName]
+                );
+            }
             return { config: rows.length > 0 ? rows[0].config : null };
         });
     }
 
     async getAllConfigs(appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            // Join with components to return current name (even if renamed)
             var rows = await manager.query(
-                `SELECT component_name, config FROM pivot_table_configs WHERE app_version_id = $1`,
+                `SELECT ptc.component_name, ptc.component_id, ptc.config,
+                        COALESCE(c.name, ptc.component_name) AS current_name
+                 FROM pivot_table_configs ptc
+                 LEFT JOIN components c ON ptc.component_id = c.id
+                 WHERE ptc.app_version_id = $1`,
                 [appVersionId]
             );
             var configs = {};
-            for (var r of rows) configs[r.component_name] = r.config;
+            for (var r of rows) configs[r.current_name] = r.config;
             return { configs };
         });
     }
 
     async upsertConfig(dto) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
-            var result = await manager.query(
-                `INSERT INTO pivot_table_configs (app_version_id, component_name, config)
-                 VALUES ($1, $2, $3)
-                 ON CONFLICT ON CONSTRAINT uq_pivot_config_version_component
-                 DO UPDATE SET config = $3, updated_at = NOW()
-                 RETURNING *`,
-                [dto.app_version_id, dto.component_name, JSON.stringify(dto.config)]
-            );
-            return { config: result[0] };
+            var compId = await this._resolveComponentId(manager, dto.app_version_id, dto.component_name);
+
+            if (compId) {
+                // Upsert by component_id (preferred — survives rename)
+                var result = await manager.query(
+                    `INSERT INTO pivot_table_configs (app_version_id, component_id, component_name, config)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (app_version_id, component_id) WHERE component_id IS NOT NULL
+                     DO UPDATE SET config = $4, component_name = $3, updated_at = NOW()
+                     RETURNING *`,
+                    [dto.app_version_id, compId, dto.component_name, JSON.stringify(dto.config)]
+                );
+                // Clean up any old row by component_name (from before migration)
+                await manager.query(
+                    `DELETE FROM pivot_table_configs
+                     WHERE app_version_id = $1 AND component_name = $2 AND component_id IS NULL`,
+                    [dto.app_version_id, dto.component_name]
+                ).catch(function () {});
+                return { config: result[0] };
+            } else {
+                // Fallback: component not found in DB, use name-based (legacy)
+                var result = await manager.query(
+                    `INSERT INTO pivot_table_configs (app_version_id, component_name, config)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT ON CONSTRAINT uq_pivot_config_version_component
+                     DO UPDATE SET config = $3, updated_at = NOW()
+                     RETURNING *`,
+                    [dto.app_version_id, dto.component_name, JSON.stringify(dto.config)]
+                );
+                return { config: result[0] };
+            }
         });
     }
 
