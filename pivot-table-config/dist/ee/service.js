@@ -16,8 +16,16 @@ const SQL_KINDS = ['mysql', 'mariadb', 'postgresql', 'mssql', 'oracle', 'starroc
 const MAX_PAGE_SIZE = 2000;
 const VALID_AGGREGATORS = Object.keys(AGG_SQL);
 
-function escId(name) {
-    return '`' + String(name).replace(/`/g, '``').replace(/[\x00-\x1f]/g, '') + '`';
+function escId(name, kind) {
+    var s = String(name).replace(/[\x00-\x1f\x7f]/g, ''); // strip control chars
+    switch (kind) {
+        case 'mssql':
+            return '[' + s.replace(/\]/g, ']]') + ']';
+        case 'mysql': case 'mariadb': case 'starrocks': case 'clickhouse':
+            return '`' + s.replace(/`/g, '``') + '`';
+        default: // postgresql, bigquery, snowflake, redshift, oracle
+            return '"' + s.replace(/"/g, '""') + '"';
+    }
 }
 
 // ===================== CREDENTIAL DECRYPTION =====================
@@ -45,6 +53,7 @@ function decryptColumnValue(table, column, cipherText) {
     var derivedKey = computeAttributeKey(table, column);
     var key = Buffer.from(derivedKey, 'hex');
     var buf = Buffer.from(cipherText, 'base64');
+    if (buf.length < 28) throw new Error('Ciphertext too short'); // 12 nonce + 16 auth tag minimum
     var nonce = buf.subarray(0, 12);
     var authTag = buf.subarray(-16);
     var encrypted = buf.subarray(12, -16);
@@ -54,6 +63,25 @@ function decryptColumnValue(table, column, cipherText) {
 }
 
 let PivotTableConfigService = class PivotTableConfigService {
+
+    // ===================== AUTHORIZATION =====================
+
+    // Verify the user's organization owns this app_version_id
+    async _verifyAccess(manager, user, appVersionId) {
+        if (!user || !user.organizationId) {
+            throw new common_1.HttpException('Unauthorized', common_1.HttpStatus.UNAUTHORIZED);
+        }
+        var rows = await manager.query(
+            `SELECT av.id FROM app_versions av
+             JOIN apps a ON av.app_id = a.id
+             WHERE av.id = $1 AND a.organization_id = $2
+             LIMIT 1`,
+            [appVersionId, user.organizationId]
+        );
+        if (rows.length === 0) {
+            throw new common_1.HttpException('App version not found', common_1.HttpStatus.NOT_FOUND);
+        }
+    }
 
     // ===================== CONFIG CRUD =====================
 
@@ -69,8 +97,9 @@ let PivotTableConfigService = class PivotTableConfigService {
         return rows.length > 0 ? rows[0].id : null;
     }
 
-    async getConfig(appVersionId, componentName) {
+    async getConfig(user, appVersionId, componentName) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
             var compId = await this._resolveComponentId(manager, appVersionId, componentName);
 
             // Try by component_id first
@@ -94,14 +123,15 @@ let PivotTableConfigService = class PivotTableConfigService {
                     `UPDATE pivot_table_configs SET component_id = $1, component_name = $2, updated_at = NOW()
                      WHERE id = $3 AND (component_id IS NULL OR component_id != $1)`,
                     [compId, componentName, rows[0].id]
-                ).catch(function () {});
+                ).catch(function (e) { console.warn('[PivotTable] auto-migrate component_id failed:', e.message); });
             }
             return { config: rows.length > 0 ? rows[0].config : null };
         });
     }
 
-    async getAllConfigs(appVersionId) {
+    async getAllConfigs(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
             // Join with components to return current name (even if renamed)
             var rows = await manager.query(
                 `SELECT ptc.component_name, ptc.component_id, ptc.config,
@@ -117,8 +147,9 @@ let PivotTableConfigService = class PivotTableConfigService {
         });
     }
 
-    async upsertConfig(dto) {
+    async upsertConfig(user, dto) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, dto.app_version_id);
             var compId = await this._resolveComponentId(manager, dto.app_version_id, dto.component_name);
             var configJson = JSON.stringify(dto.config);
 
@@ -138,7 +169,7 @@ let PivotTableConfigService = class PivotTableConfigService {
                         `DELETE FROM pivot_table_configs
                          WHERE app_version_id = $1 AND component_name = $2 AND (component_id IS NULL OR component_id != $3)`,
                         [dto.app_version_id, dto.component_name, compId]
-                    ).catch(function () {});
+                    ).catch(function (e) { console.warn('[PivotTable] legacy cleanup failed:', e.message); });
                     return { config: updated[0] };
                 }
 
@@ -147,7 +178,7 @@ let PivotTableConfigService = class PivotTableConfigService {
                     `DELETE FROM pivot_table_configs
                      WHERE app_version_id = $1 AND (component_name = $2 AND component_id IS NULL)`,
                     [dto.app_version_id, dto.component_name]
-                ).catch(function () {});
+                ).catch(function (e) { console.warn('[PivotTable] legacy cleanup failed:', e.message); });
 
                 var result = await manager.query(
                     `INSERT INTO pivot_table_configs (app_version_id, component_id, component_name, config)
@@ -181,12 +212,15 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== DATASOURCE DETECTION =====================
 
-    async detectDataSource(appVersionId, componentName) {
+    async detectDataSource(user, appVersionId, componentName) {
+        // Verify authorization
+        await (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
+        });
+
         var queryInfo = await this._resolveComponentQuery(appVersionId, componentName);
         if (!queryInfo) {
-            // Return debug info to help diagnose
-            var debug = await this._debugComponentQuery(appVersionId, componentName);
-            return { supported: false, kind: null, query_name: null, reason: 'No data query bound to this component', debug: debug };
+            return { supported: false, kind: null, query_name: null, reason: 'No data query bound to this component' };
         }
         var kind = (queryInfo.kind || '').toLowerCase();
         var supported = SQL_KINDS.indexOf(kind) !== -1;
@@ -200,16 +234,22 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== BACKEND PIVOT EXECUTION =====================
 
-    async executePivot(appVersionId, componentName, pivotConfig, page, pageSize) {
-        // 0. Validate pagination params
+    async executePivot(user, appVersionId, componentName, pivotConfig, page, pageSize) {
+        // 0. Verify authorization
+        await (0, database_helper_1.dbTransactionWrap)(async (manager) => {
+            await this._verifyAccess(manager, user, appVersionId);
+        });
+
+        // 1. Validate pagination params
         if (pageSize !== null && pageSize !== undefined) {
             pageSize = parseInt(pageSize, 10);
-            if (isNaN(pageSize) || pageSize < 0) pageSize = 0;
-            if (pageSize > MAX_PAGE_SIZE) pageSize = MAX_PAGE_SIZE;
+            if (isNaN(pageSize) || pageSize <= 0) pageSize = null; // treat 0 and negative as "no pagination"
+            else if (pageSize > MAX_PAGE_SIZE) pageSize = MAX_PAGE_SIZE;
         }
         if (page !== null && page !== undefined) {
             page = parseInt(page, 10);
             if (isNaN(page) || page < 0) page = 0;
+            if (page > 100000) page = 100000; // upper bound safety
         }
 
         // Validate aggregator
@@ -241,8 +281,10 @@ let PivotTableConfigService = class PivotTableConfigService {
         // 2. Resolve datasource connection credentials (same way ToolJet does)
         var sourceOptions = await this._resolveSourceOptions(queryInfo.data_source_id, appVersionId);
 
+        var dbKind = (queryInfo.kind || '').toLowerCase();
+
         // 3. Generate pivot SQL (with optional LIMIT/OFFSET)
-        var pivotSql = this._buildPivotSql(originalSql, pivotConfig, page, pageSize);
+        var pivotSql = this._buildPivotSql(originalSql, pivotConfig, page, pageSize, dbKind);
 
         // 4. Execute using ToolJet's plugin system (same driver as the datasource)
         try {
@@ -253,32 +295,30 @@ let PivotTableConfigService = class PivotTableConfigService {
             var grandTotals = null;
             if (pageSize && pageSize > 0) {
                 // Count query: total number of grouped rows
-                var countSql = this._buildPivotCountSql(originalSql, pivotConfig);
+                var countSql = this._buildPivotCountSql(originalSql, pivotConfig, dbKind);
                 var countResult = await this._executeQuery(sourceOptions, countSql, queryInfo.kind, queryInfo.data_source_id);
                 total = countResult && countResult[0] ? parseInt(countResult[0]._pivot_total || countResult[0].total || 0, 10) : 0;
 
                 // Grand total query: aggregate across ALL data (for grand total row)
-                var grandTotalSql = this._buildGrandTotalSql(originalSql, pivotConfig);
+                var grandTotalSql = this._buildGrandTotalSql(originalSql, pivotConfig, dbKind);
                 if (grandTotalSql) {
                     try {
                         var gtResult = await this._executeQuery(sourceOptions, grandTotalSql, queryInfo.kind, queryInfo.data_source_id);
                         grandTotals = gtResult || [];
-                    } catch (_) { /* grand total is optional, don't fail */ }
+                    } catch (gtErr) { console.warn('[PivotTable] grand total query failed:', gtErr.message); }
                 }
             }
 
             return { data: rows, total: total, grand_totals: grandTotals, query_name: queryInfo.name };
         } catch (err) {
-            // Re-throw with debug info
-            var debugInfo = {
-                message: err.message || err.response?.message || String(err),
-                sql: pivotSql,
-                original_sql: originalSql,
+            // Log debug info server-side only (never expose SQL to client)
+            console.error('[PivotTable] Query failed:', {
+                message: err.message || String(err),
                 kind: queryInfo.kind,
-                source_keys: Object.keys(sourceOptions),
-            };
+                sql: pivotSql.substring(0, 500),
+            });
             throw new common_1.HttpException(
-                'Pivot query failed: ' + JSON.stringify(debugInfo),
+                'Pivot query failed. Check server logs for details.',
                 err.status || common_1.HttpStatus.BAD_REQUEST
             );
         }
@@ -334,33 +374,6 @@ let PivotTableConfigService = class PivotTableConfigService {
         });
     }
 
-    // Debug helper: return raw component info for diagnostics
-    async _debugComponentQuery(appVersionId, componentName) {
-        return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
-            // Check if component exists at all
-            var compRows = await manager.query(
-                `SELECT c.name, c.type, LEFT(c.properties::text, 500) as props_preview
-                 FROM components c
-                 JOIN pages p ON c.page_id = p.id
-                 WHERE p.app_version_id = $1
-                 ORDER BY c.name`,
-                [appVersionId]
-            );
-
-            var allNames = compRows.map(function (r) { return r.name + ' (' + r.type + ')'; });
-
-            // Find exact match
-            var match = compRows.find(function (r) { return r.name === componentName; });
-
-            return {
-                components_found: allNames,
-                searched_for: componentName,
-                match_found: !!match,
-                props_preview: match ? match.props_preview : null,
-            };
-        });
-    }
-
     // ===================== INTERNAL: RESOLVE DATASOURCE CREDENTIALS =====================
 
     async _resolveSourceOptions(dataSourceId, appVersionId) {
@@ -387,7 +400,11 @@ let PivotTableConfigService = class PivotTableConfigService {
             }
 
             var rawOptions = optRows[0].options;
-            if (typeof rawOptions === 'string') rawOptions = JSON.parse(rawOptions);
+            if (typeof rawOptions === 'string') {
+                try { rawOptions = JSON.parse(rawOptions); } catch (e) {
+                    throw new common_1.HttpException('Malformed datasource options', common_1.HttpStatus.INTERNAL_SERVER_ERROR);
+                }
+            }
 
             // Parse and decrypt each option (same logic as DataSourcesUtilService.parseSourceOptions)
             var parsed = {};
@@ -406,6 +423,7 @@ let PivotTableConfigService = class PivotTableConfigService {
                                 parsed[key] = opt.value || '';
                             }
                         } catch (decErr) {
+                            console.warn('[PivotTable] decryption failed for key:', key, decErr.message);
                             parsed[key] = opt.value || '';
                         }
                     } else {
@@ -432,7 +450,7 @@ let PivotTableConfigService = class PivotTableConfigService {
         return opts.query || opts.sql || null;
     }
 
-    _buildPivotSql(originalSql, config, page, pageSize) {
+    _buildPivotSql(originalSql, config, page, pageSize, kind) {
         var rowFields = config.rowFields || [];
         var colFields = config.colFields || [];
         var valueField = config.valueField || '';
@@ -443,39 +461,46 @@ let PivotTableConfigService = class PivotTableConfigService {
             throw new common_1.HttpException('At least one row or column field required', common_1.HttpStatus.BAD_REQUEST);
         }
 
-        var selectParts = allGroupFields.map(function (f) { return escId(f); });
+        var esc = function (f) { return escId(f, kind); };
+        var alias = function (a) { return escId(a, kind); };
+        var selectParts = allGroupFields.map(esc);
         var aggFunc = AGG_SQL[aggregator] || 'COUNT(*)';
 
         if (aggregator === 'count' || !valueField) {
-            selectParts.push('COUNT(*) AS `_pivot_value`');
+            selectParts.push('COUNT(*) AS ' + alias('_pivot_value'));
         } else {
-            selectParts.push(aggFunc + '(' + escId(valueField) + ') AS `_pivot_value`');
+            selectParts.push(aggFunc + '(' + esc(valueField) + ') AS ' + alias('_pivot_value'));
         }
-        selectParts.push('COUNT(*) AS `_pivot_count`');
+        // For weighted avg: use COUNT(valueField) to exclude NULLs, else COUNT(*)
+        if (aggregator === 'avg' && valueField) {
+            selectParts.push('COUNT(' + esc(valueField) + ') AS ' + alias('_pivot_count'));
+        } else {
+            selectParts.push('COUNT(*) AS ' + alias('_pivot_count'));
+        }
 
-        var groupBy = allGroupFields.map(function (f) { return escId(f); });
-        var rowGroupBy = rowFields.map(function (f) { return escId(f); });
+        var groupBy = allGroupFields.map(esc);
+        var rowGroupBy = rowFields.map(esc);
         var cleanSql = originalSql.replace(/;\s*$/, '');
 
         // Base grouped query (no pagination)
         var baseSql = 'SELECT ' + selectParts.join(', ') + '\n' +
-            'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+            'FROM (\n' + cleanSql + '\n) AS ' + alias('_pivot_src') + '\n' +
             'GROUP BY ' + groupBy.join(', ');
 
         // Pagination: use DENSE_RANK on rowFields to keep all cells of one row key on same page
         if (pageSize && pageSize > 0 && rowFields.length > 0 && colFields.length > 0) {
             var rankOrder = rowGroupBy.join(', ');
             var rankedParts = selectParts.slice();
-            rankedParts.push('DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS `_pivot_row_rank`');
+            rankedParts.push('DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS ' + alias('_pivot_row_rank'));
 
             var rankedSql = 'SELECT ' + rankedParts.join(', ') + '\n' +
-                'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+                'FROM (\n' + cleanSql + '\n) AS ' + alias('_pivot_src') + '\n' +
                 'GROUP BY ' + groupBy.join(', ');
 
             var offset = (page || 0) * pageSize;
-            return 'SELECT * FROM (\n' + rankedSql + '\n) AS `_pivot_page`\n' +
-                'WHERE `_pivot_row_rank` > ' + parseInt(offset, 10) +
-                ' AND `_pivot_row_rank` <= ' + parseInt(offset + pageSize, 10) + '\n' +
+            return 'SELECT * FROM (\n' + rankedSql + '\n) AS ' + alias('_pivot_page') + '\n' +
+                'WHERE ' + alias('_pivot_row_rank') + ' > ' + parseInt(offset, 10) +
+                ' AND ' + alias('_pivot_row_rank') + ' <= ' + parseInt(offset + pageSize, 10) + '\n' +
                 'ORDER BY ' + groupBy.join(', ');
         } else if (pageSize && pageSize > 0) {
             // No colFields: each grouped row = one visual row, simple LIMIT/OFFSET
@@ -487,46 +512,53 @@ let PivotTableConfigService = class PivotTableConfigService {
         return baseSql + '\nORDER BY ' + groupBy.join(', ');
     }
 
-    _buildPivotCountSql(originalSql, config) {
+    _buildPivotCountSql(originalSql, config, kind) {
         var rowFields = config.rowFields || [];
-        if (rowFields.length === 0) return 'SELECT 0 AS `_pivot_total`';
+        var esc = function (f) { return escId(f, kind); };
+        if (rowFields.length === 0) return 'SELECT 0 AS ' + esc('_pivot_total');
 
         // Count distinct row keys (visual rows), not all GROUP BY combinations
-        var groupBy = rowFields.map(function (f) { return escId(f); });
+        var groupBy = rowFields.map(esc);
         var cleanSql = originalSql.replace(/;\s*$/, '');
 
-        return 'SELECT COUNT(*) AS `_pivot_total` FROM (\n' +
-            'SELECT 1 FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+        return 'SELECT COUNT(*) AS ' + esc('_pivot_total') + ' FROM (\n' +
+            'SELECT 1 FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src') + '\n' +
             'GROUP BY ' + groupBy.join(', ') + '\n' +
-            ') AS `_pivot_cnt`';
+            ') AS ' + esc('_pivot_cnt');
     }
 
-    _buildGrandTotalSql(originalSql, config) {
+    _buildGrandTotalSql(originalSql, config, kind) {
         var colFields = config.colFields || [];
         var valueField = config.valueField || '';
         var aggregator = config.aggregator || 'count';
         var cleanSql = originalSql.replace(/;\s*$/, '');
         var aggFunc = AGG_SQL[aggregator] || 'COUNT(*)';
+        var esc = function (f) { return escId(f, kind); };
 
         if (colFields.length > 0) {
             // Grand total per column value + overall total
-            var selectParts = colFields.map(function (f) { return escId(f); });
+            var selectParts = colFields.map(esc);
             if (aggregator === 'count' || !valueField) {
-                selectParts.push('COUNT(*) AS `_pivot_value`');
+                selectParts.push('COUNT(*) AS ' + esc('_pivot_value'));
             } else {
-                selectParts.push(aggFunc + '(' + escId(valueField) + ') AS `_pivot_value`');
+                selectParts.push(aggFunc + '(' + esc(valueField) + ') AS ' + esc('_pivot_value'));
             }
-            selectParts.push('COUNT(*) AS `_pivot_count`'); // for weighted avg grand total
-            var groupBy = colFields.map(function (f) { return escId(f); });
+            // For weighted avg: use COUNT(valueField) to exclude NULLs
+            if (aggregator === 'avg' && valueField) {
+                selectParts.push('COUNT(' + esc(valueField) + ') AS ' + esc('_pivot_count'));
+            } else {
+                selectParts.push('COUNT(*) AS ' + esc('_pivot_count'));
+            }
+            var groupBy = colFields.map(esc);
 
             return 'SELECT ' + selectParts.join(', ') + '\n' +
-                'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+                'FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src') + '\n' +
                 'GROUP BY ' + groupBy.join(', ') + '\n' +
                 'ORDER BY ' + groupBy.join(', ');
         } else {
             // No column fields: just overall total
-            var valExpr = (aggregator === 'count' || !valueField) ? 'COUNT(*)' : aggFunc + '(' + escId(valueField) + ')';
-            return 'SELECT ' + valExpr + ' AS `_pivot_value` FROM (\n' + cleanSql + '\n) AS `_pivot_src`';
+            var valExpr = (aggregator === 'count' || !valueField) ? 'COUNT(*)' : aggFunc + '(' + esc(valueField) + ')';
+            return 'SELECT ' + valExpr + ' AS ' + esc('_pivot_value') + ' FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src');
         }
     }
 

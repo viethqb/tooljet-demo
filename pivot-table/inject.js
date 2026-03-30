@@ -502,7 +502,7 @@
     var table = overlayEl.querySelector('.pivot-table');
     if (!table) return;
     var title = (config && config.titleAlias) ? config.titleAlias : '';
-    var X = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); };
+    var X = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); };
 
     // Count total columns
     var totalCols = 0;
@@ -1418,14 +1418,18 @@
       h += '<input type="text" class="pivot-cfg-input pivot-cfg-grandTotalLabel" value="' + esc(config.grandTotalLabel || 'Grand Total') + '" placeholder="Grand Total"/>';
       h += '</div>';
 
-      // Subtotals (rows grouped by first field)
+      // Subtotals (rows grouped by first field) — disabled for backend pivot
+      var subtotalDisabled = config.backendPivot ? ' disabled' : '';
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Subtotals</label>';
       h += '<label class="pivot-toggle-switch">';
-      h += '<input type="checkbox" class="pivot-cfg-showSubtotal"' + (config.showSubtotal ? ' checked' : '') + '/>';
+      h += '<input type="checkbox" class="pivot-cfg-showSubtotal"' + (config.showSubtotal && !config.backendPivot ? ' checked' : '') + subtotalDisabled + '/>';
       h += '<span class="pivot-toggle-slider"></span>';
       h += '</label></div>';
-      h += '<div class="pivot-prop-row">';
+      if (config.backendPivot) {
+        h += '<div class="pivot-prop-row"><span style="font-size:11px;color:#888;">Subtotals not available with backend pivot</span></div>';
+      }
+      h += '<div class="pivot-prop-row"' + (config.backendPivot ? ' style="display:none"' : '') + '>';
       h += '<label class="pivot-prop-label">Label</label>';
       h += '<input type="text" class="pivot-cfg-input pivot-cfg-subtotalLabel" value="' + esc(config.subtotalLabel || 'Subtotal') + '" placeholder="Subtotal"/>';
       h += '</div>';
