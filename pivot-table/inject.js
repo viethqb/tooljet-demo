@@ -256,7 +256,7 @@
       styleRowFields: 'bold', styleColValues: '', styleRowTotal: '',
       styleGrandTotal: 'bold', styleSubtotal: 'bold italic',
       emptyValue: '-',
-      pageSize: 0, // 0 = all (no pagination)
+      pageSize: 0, // 0 = all
     };
   }
 
@@ -1385,7 +1385,7 @@
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Page Size</label>';
       h += '<select class="pivot-cfg-select pivot-cfg-pageSize">';
-      var pageSizes = [[0, 'All'], [10, '10'], [20, '20'], [50, '50'], [100, '100']];
+      var pageSizes = [[0, 'All'], [10, '10'], [20, '20'], [50, '50'], [100, '100'], [500, '500'], [1000, '1000'], [2000, '2000']];
       var curPS = config.pageSize || 0;
       for (var pi = 0; pi < pageSizes.length; pi++) {
         h += '<option value="' + pageSizes[pi][0] + '"' + (curPS == pageSizes[pi][0] ? ' selected' : '') + '>' + pageSizes[pi][1] + '</option>';
