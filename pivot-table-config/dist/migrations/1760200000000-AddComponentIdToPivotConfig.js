@@ -23,7 +23,13 @@ class AddComponentIdToPivotConfig1760200000000 {
               AND ptc.component_id IS NULL
         `);
 
-        // Create unique constraint on (app_version_id, component_id) for rows that have component_id
+        // Drop old constraint (component_name is no longer unique key — same name can exist on different pages)
+        await queryRunner.query(`
+            ALTER TABLE "pivot_table_configs"
+            DROP CONSTRAINT IF EXISTS "uq_pivot_config_version_component"
+        `);
+
+        // Create unique constraint on (app_version_id, component_id) — the new primary key for configs
         await queryRunner.query(`
             CREATE UNIQUE INDEX IF NOT EXISTS "uq_pivot_config_version_component_id"
             ON "pivot_table_configs"("app_version_id", "component_id")
@@ -41,6 +47,10 @@ class AddComponentIdToPivotConfig1760200000000 {
     async down(queryRunner) {
         await queryRunner.query(`DROP INDEX IF EXISTS "idx_pivot_config_component_id"`);
         await queryRunner.query(`DROP INDEX IF EXISTS "uq_pivot_config_version_component_id"`);
+        await queryRunner.query(`
+            ALTER TABLE "pivot_table_configs"
+            ADD CONSTRAINT "uq_pivot_config_version_component" UNIQUE ("app_version_id", "component_name")
+        `);
         await queryRunner.query(`ALTER TABLE "pivot_table_configs" DROP COLUMN IF EXISTS "component_id"`);
     }
 }

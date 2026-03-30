@@ -1154,6 +1154,8 @@
     var SECTION_ID = 'pivot-inspector-section';
     var activeWidget = null;
     var _configLoadPending = false;
+    var _configRetryCount = 0;
+    var _previousWidget = null; // track previous widget for rename detection
     var cachedColumns = [];
 
     // In-memory config cache — single source of truth, never lost on DOM removal
@@ -1617,9 +1619,20 @@
             console.log(LOG_PREFIX, 'Backend detect result:', JSON.stringify(result));
             if (!result) return;
             if (result.supported) {
-              // Supported: enable toggle, show query info
-              if (backendCb) { backendCb.disabled = false; }
+              // Supported: force on, disable toggle (always use backend for SQL)
+              if (backendCb) {
+                backendCb.checked = true;
+                backendCb.disabled = true;
+              }
               if (backendInfo) backendInfo.textContent = 'Query: ' + (result.query_name || '?') + ' (' + result.kind + ')';
+              // Ensure config reflects forced-on state
+              var cfgOn = getConfig(widgetName);
+              if (!cfgOn.backendPivot) {
+                cfgOn.backendPivot = true;
+                setConfig(widgetName, cfgOn);
+                delete _backendPivotCache[widgetName];
+                if (cfgOn.enabled) updatePreview(widgetName, cfgOn);
+              }
             } else {
               // Not supported: force off, disable toggle, show reason
               if (backendCb) {
@@ -1841,25 +1854,65 @@
         return;
       }
 
-      // Case 2: Different widget selected
+      // Case 2: Different widget selected (or renamed)
       if (widgetName !== activeWidget) {
 
+        // Carry config from old name to new name if new name has no config
+        // Handles both rename and intermediate typing states
+        var isRename = false;
+        if (activeWidget && configCache[activeWidget] && !configCache[widgetName]) {
+          isRename = true;
+          configCache[widgetName] = configCache[activeWidget];
+          saveConfigLocal(widgetName, configCache[widgetName]);
+          // Save to API immediately + retry after 2s (ToolJet DB name update may lag)
+          saveConfig(widgetName, configCache[widgetName]);
+          setTimeout(function () {
+            if (configCache[widgetName]) saveConfig(widgetName, configCache[widgetName]);
+          }, 2000);
+          console.log(LOG_PREFIX, 'Config carried:', activeWidget, '→', widgetName);
+        }
+
+        _previousWidget = activeWidget;
         if (section) section.remove();
         activeWidget = widgetName;
         section = null;
+        _configRetryCount = 0;
         refreshColumns(widgetName);
         console.log(LOG_PREFIX, 'Table selected:', widgetName, 'columns:', cachedColumns);
 
         // Pre-fetch config from API (updates cache + localStorage, then re-inject)
         if (!configCache[widgetName] && !_configLoadPending) {
           _configLoadPending = true;
-          loadConfigAsync(widgetName, function (apiConfig) {
-            _configLoadPending = false;
-            if (apiConfig) {
-              configCache[widgetName] = apiConfig;
-              forceReinject = true; // trigger re-inject with API data
-            }
-          });
+          _configRetryCount = 0;
+          (function retryLoad(retryName) {
+            loadConfigAsync(retryName, function (apiConfig) {
+              // Abort if widget changed while loading
+              if (activeWidget !== retryName) { _configLoadPending = false; return; }
+              if (apiConfig) {
+                _configLoadPending = false;
+                _configRetryCount = 0;
+                configCache[retryName] = apiConfig;
+                forceReinject = true;
+              } else if (_configRetryCount < 5) {
+                // Retry: DB might not have updated the component name yet (rename)
+                _configRetryCount++;
+                console.log(LOG_PREFIX, 'Config not found for', retryName, '- retry', _configRetryCount);
+                setTimeout(function () {
+                  if (activeWidget === retryName && !configCache[retryName]) {
+                    retryLoad(retryName);
+                  } else {
+                    _configLoadPending = false;
+                  }
+                }, 500);
+              } else {
+                _configLoadPending = false;
+                _configRetryCount = 0;
+              }
+            });
+          })(widgetName);
+        } else if (isRename) {
+          // Config already carried over from rename, force re-inject
+          forceReinject = true;
         }
       }
 
@@ -1877,17 +1930,20 @@
         }
       }
 
-      // Case 3: Section exists and no force → skip
+      // Case 3: Config loading from API — wait before injecting to prevent overwrite
+      if (_configLoadPending) return;
+
+      // Case 4: Section exists and no force → skip
       if (section && !forceReinject) return;
       forceReinject = false;
 
-      // Case 4: Inject the section
+      // Case 5: Inject the section
       var accordion = findAccordion();
       if (!accordion) return;
 
       if (section) section.remove();
 
-      // getConfig: memory → localStorage → default (never loses data)
+      // getConfig: memory → localStorage → default
       var config = getConfig(widgetName);
       console.log(LOG_PREFIX, 'Injecting for', widgetName, JSON.stringify(config));
       var newSection = buildSection(config);
