@@ -1463,7 +1463,7 @@
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Decimals</label>';
       h += '<select class="pivot-cfg-select pivot-cfg-decimalPlaces">';
-      var dpOpts = [['auto', 'Auto'], ['0', '0'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6']];
+      var dpOpts = [['auto', 'Auto'], ['0', '0'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6'], ['7', '7'], ['8', '8'], ['9', '9'], ['10', '10']];
       var curDP = config.decimalPlaces !== undefined ? String(config.decimalPlaces) : 'auto';
       for (var dpi = 0; dpi < dpOpts.length; dpi++) {
         h += '<option value="' + dpOpts[dpi][0] + '"' + (curDP === dpOpts[dpi][0] ? ' selected' : '') + '>' + dpOpts[dpi][1] + '</option>';
