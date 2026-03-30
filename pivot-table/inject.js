@@ -263,8 +263,14 @@
   // ===================== PAGINATION STATE (runtime, not persisted) =====================
   var _pivotPage = {}; // componentName -> current page (0-based)
 
-  function getPivotPage(name) { return _pivotPage[name] || 0; }
-  function setPivotPage(name, page) { _pivotPage[name] = page; }
+  function getPivotPage(name) {
+    if (_pivotPage[name] !== undefined) return _pivotPage[name];
+    try { var p = parseInt(sessionStorage.getItem('pivotPage__' + name), 10); return isNaN(p) ? 0 : p; } catch (_) { return 0; }
+  }
+  function setPivotPage(name, page) {
+    _pivotPage[name] = page;
+    try { sessionStorage.setItem('pivotPage__' + name, page); } catch (_) {}
+  }
 
   // ===================== AGGREGATORS =====================
   const AGG = {
@@ -277,7 +283,15 @@
 
   // ===================== DATA EXTRACTION + CACHE =====================
   // Cache per component name — survives display:none (virtualized table renders 0 rows when hidden)
-  var dataCache = {}; // componentName -> { columns: [], data: [] }
+  var CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  var dataCache = {}; // componentName -> { columns: [], data: [], _ts: timestamp }
+
+  // Evict stale caches periodically
+  setInterval(function () {
+    var now = Date.now();
+    for (var k in dataCache) { if (dataCache[k]._ts && now - dataCache[k]._ts > CACHE_TTL) delete dataCache[k]; }
+    for (var k2 in _backendPivotCache) { if (_backendPivotCache[k2].timestamp && now - _backendPivotCache[k2].timestamp > CACHE_TTL) delete _backendPivotCache[k2]; }
+  }, 60000);
 
   function getComponentName(tableEl) {
     var cy = tableEl.getAttribute('data-cy') || '';
@@ -345,7 +359,7 @@
 
     // If DOM returned data, update cache
     if (result.data.length > 0) {
-      if (name) dataCache[name] = result;
+      if (name) { result._ts = Date.now(); dataCache[name] = result; }
       return result;
     }
 
@@ -387,12 +401,12 @@
       setTimeout(function () {
         var result = extractDataRaw(tableEl);
         if (result.data.length > 0 && name) {
-          dataCache[name] = result;
+          result._ts = Date.now(); dataCache[name] = result;
         }
         // Re-hide
         if (wasHidden && dataArea) dataArea.style.display = 'none';
         callback(result.data.length > 0 ? result : (name && dataCache[name]) ? dataCache[name] : result);
-      }, 50);
+      }, 150);
     });
   }
 
@@ -774,7 +788,7 @@
 
         if (config.backendPivot && pageSize > 0) {
           // Backend paging: re-fetch from API with new page
-          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty">Loading page ' + (page + 1) + '...</div>';
+          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty"><span class="pivot-spinner"></span> Loading page ' + (page + 1) + '...</div>';
           executePivotAsync(componentName, config, function (err, rows, total, grandTotals) {
             if (err) {
               overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>';
@@ -1139,6 +1153,7 @@
   if (isEditor) {
     var SECTION_ID = 'pivot-inspector-section';
     var activeWidget = null;
+    var _configLoadPending = false;
     var cachedColumns = [];
 
     // In-memory config cache — single source of truth, never lost on DOM removal
@@ -1551,6 +1566,7 @@
     }
 
     // ---- BIND EVENTS ----
+    var _debounceTimer = null;
     function bindEvents(section, widgetName) {
       function onConfigChange() {
         var config = readConfigFromDOM(section);
@@ -1624,12 +1640,17 @@
           .catch(function () {});
       }
 
-      // Text inputs (labels) — save on blur and Enter
+      // Text inputs (labels) — debounced save on input, immediate on blur/Enter
+      function onConfigChangeDebounced() {
+        clearTimeout(_debounceTimer);
+        _debounceTimer = setTimeout(onConfigChange, 300);
+      }
       var textInputs = section.querySelectorAll('.pivot-cfg-titleAlias, .pivot-cfg-rowTotalLabel, .pivot-cfg-grandTotalLabel, .pivot-cfg-subtotalLabel');
       for (var t = 0; t < textInputs.length; t++) {
-        textInputs[t].addEventListener('blur', onConfigChange);
+        textInputs[t].addEventListener('input', onConfigChangeDebounced);
+        textInputs[t].addEventListener('blur', function () { clearTimeout(_debounceTimer); onConfigChange(); });
         textInputs[t].addEventListener('keydown', function (e) {
-          if (e.key === 'Enter') { e.preventDefault(); onConfigChange(); }
+          if (e.key === 'Enter') { e.preventDefault(); clearTimeout(_debounceTimer); onConfigChange(); }
         });
       }
 
@@ -1754,13 +1775,14 @@
 
         if (config.backendPivot) {
           // Backend pivot: call server API directly (no need for query to run on frontend)
-          showOverlayMsg('Loading pivot data from server...');
+          showOverlayMsg('<span class="pivot-spinner"></span> <span class="pivot-spinner"></span> Loading...');
           var bpPageSize = config.pageSize || 0;
           var bpPage = bpPageSize > 0 ? getPivotPage(widgetName) : 0;
           executePivotAsync(widgetName, config, function (err, rows, total, grandTotals) {
             if (err) {
-              // Fallback to frontend pivot silently
+              // Fallback to frontend pivot with notification
               console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
+              showOverlayMsg('Backend pivot unavailable, using frontend...', false);
               extractDataAsync(tableEl, function (extracted) {
                 if (extracted.data.length > 0) { renderIntoOverlay(extracted.data); }
                 else { showOverlayMsg('No data available', false); }
@@ -1829,8 +1851,10 @@
         console.log(LOG_PREFIX, 'Table selected:', widgetName, 'columns:', cachedColumns);
 
         // Pre-fetch config from API (updates cache + localStorage, then re-inject)
-        if (!configCache[widgetName]) {
+        if (!configCache[widgetName] && !_configLoadPending) {
+          _configLoadPending = true;
           loadConfigAsync(widgetName, function (apiConfig) {
+            _configLoadPending = false;
             if (apiConfig) {
               configCache[widgetName] = apiConfig;
               forceReinject = true; // trigger re-inject with API data
@@ -2058,7 +2082,7 @@
           else tableEl.appendChild(overlay);
         }
         overlay.style.display = 'flex';
-        overlay.innerHTML = '<div class="pivot-empty">Loading pivot data...</div>';
+        overlay.innerHTML = '<div class="pivot-empty"><span class="pivot-spinner"></span> Loading...</div>';
       }
 
       function showError(msg) {

@@ -13,6 +13,8 @@ const crypto = require("crypto");
 
 const AGG_SQL = { count: 'COUNT(*)', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX' };
 const SQL_KINDS = ['mysql', 'mariadb', 'postgresql', 'mssql', 'oracle', 'starrocks', 'clickhouse', 'bigquery', 'snowflake', 'redshift'];
+const MAX_PAGE_SIZE = 2000;
+const VALID_AGGREGATORS = Object.keys(AGG_SQL);
 
 function escId(name) {
     return '`' + String(name).replace(/`/g, '``').replace(/[\x00-\x1f]/g, '') + '`';
@@ -113,6 +115,32 @@ let PivotTableConfigService = class PivotTableConfigService {
     // ===================== BACKEND PIVOT EXECUTION =====================
 
     async executePivot(appVersionId, componentName, pivotConfig, page, pageSize) {
+        // 0. Validate pagination params
+        if (pageSize !== null && pageSize !== undefined) {
+            pageSize = parseInt(pageSize, 10);
+            if (isNaN(pageSize) || pageSize < 0) pageSize = 0;
+            if (pageSize > MAX_PAGE_SIZE) pageSize = MAX_PAGE_SIZE;
+        }
+        if (page !== null && page !== undefined) {
+            page = parseInt(page, 10);
+            if (isNaN(page) || page < 0) page = 0;
+        }
+
+        // Validate aggregator
+        var agg = (pivotConfig.aggregator || 'count').toLowerCase();
+        if (VALID_AGGREGATORS.indexOf(agg) === -1) agg = 'count';
+        pivotConfig.aggregator = agg;
+
+        // Validate fields: must be non-empty strings, no special chars beyond alphanumeric/underscore/space/dot
+        var fieldPattern = /^[\w\s.\-\u00C0-\u024F\u1E00-\u1EFF]+$/;
+        var allFields = (pivotConfig.rowFields || []).concat(pivotConfig.colFields || []);
+        if (pivotConfig.valueField) allFields.push(pivotConfig.valueField);
+        for (var fi = 0; fi < allFields.length; fi++) {
+            if (typeof allFields[fi] !== 'string' || !fieldPattern.test(allFields[fi])) {
+                throw new common_1.HttpException('Invalid field name: ' + String(allFields[fi]).substring(0, 50), common_1.HttpStatus.BAD_REQUEST);
+            }
+        }
+
         // 1. Resolve the data query bound to this component
         var queryInfo = await this._resolveComponentQuery(appVersionId, componentName);
         if (!queryInfo) {
@@ -303,13 +331,8 @@ let PivotTableConfigService = class PivotTableConfigService {
                 }
             }
 
-            // Log raw options structure for debugging
-            console.log('[PivotTable] rawOptions keys:', Object.keys(rawOptions).map(function (k) {
-                var o = rawOptions[k];
-                if (!o || typeof o !== 'object') return k + '=' + o;
-                return k + '(' + (o.encrypted ? 'enc:' + (o.credential_id || '?') : 'val:' + String(o.value).substring(0, 30)) + ')';
-            }));
-            console.log('[PivotTable] parsed sourceOptions:', JSON.stringify(parsed));
+            // Log keys only (never log values — may contain credentials)
+            console.log('[PivotTable] sourceOptions keys:', Object.keys(parsed).join(', '));
 
             return parsed;
         });
@@ -439,7 +462,6 @@ let PivotTableConfigService = class PivotTableConfigService {
 
         console.log('[PivotTable] Executing with plugin:', kind,
             'host:', sourceOptions.host, 'port:', sourceOptions.port,
-            'user:', sourceOptions.username || sourceOptions.user,
             'database:', sourceOptions.database);
 
         // Build query options (same format as ToolJet's MySQL/PG plugins expect)

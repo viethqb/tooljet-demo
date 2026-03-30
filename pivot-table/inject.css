@@ -359,10 +359,25 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 8px;
   height: 100%;
   min-height: 80px;
   color: var(--slate9, #889096);
   font-size: 13px;
+}
+
+.pivot-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--slate7, #d9dbdd);
+  border-top-color: var(--indigo9, #3e63dd);
+  border-radius: 50%;
+  animation: pivot-spin 0.6s linear infinite;
+}
+
+@keyframes pivot-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* =====================================================================
@@ -618,6 +633,14 @@
    SCROLLBAR
    ===================================================================== */
 
+/* Firefox scrollbar */
+.pivot-result-scroll,
+.pivot-overlay {
+  scrollbar-width: thin;
+  scrollbar-color: var(--cc-table-scroll-bar-color, #c1c8cd) transparent;
+}
+
+/* Webkit scrollbar */
 .pivot-result-scroll::-webkit-scrollbar,
 .pivot-overlay::-webkit-scrollbar {
   width: 6px;
@@ -633,4 +656,22 @@
 .pivot-result-scroll::-webkit-scrollbar-track,
 .pivot-overlay::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* =====================================================================
+   PRINT
+   ===================================================================== */
+
+@media print {
+  .pivot-toolbar,
+  .pivot-pagination,
+  .pivot-download-btn {
+    display: none !important;
+  }
+  .pivot-overlay {
+    overflow: visible !important;
+  }
+  .pivot-result-scroll {
+    overflow: visible !important;
+  }
 }
