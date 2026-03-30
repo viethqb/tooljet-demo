@@ -112,7 +112,7 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== BACKEND PIVOT EXECUTION =====================
 
-    async executePivot(appVersionId, componentName, pivotConfig) {
+    async executePivot(appVersionId, componentName, pivotConfig, page, pageSize) {
         // 1. Resolve the data query bound to this component
         var queryInfo = await this._resolveComponentQuery(appVersionId, componentName);
         if (!queryInfo) {
@@ -127,13 +127,33 @@ let PivotTableConfigService = class PivotTableConfigService {
         // 2. Resolve datasource connection credentials (same way ToolJet does)
         var sourceOptions = await this._resolveSourceOptions(queryInfo.data_source_id, appVersionId);
 
-        // 3. Generate pivot SQL
-        var pivotSql = this._buildPivotSql(originalSql, pivotConfig);
+        // 3. Generate pivot SQL (with optional LIMIT/OFFSET)
+        var pivotSql = this._buildPivotSql(originalSql, pivotConfig, page, pageSize);
 
         // 4. Execute using ToolJet's plugin system (same driver as the datasource)
         try {
             var rows = await this._executeQuery(sourceOptions, pivotSql, queryInfo.kind, queryInfo.data_source_id);
-            return { data: rows, query_name: queryInfo.name };
+
+            // 5. If paginated, also get total count + grand totals
+            var total = null;
+            var grandTotals = null;
+            if (pageSize && pageSize > 0) {
+                // Count query: total number of grouped rows
+                var countSql = this._buildPivotCountSql(originalSql, pivotConfig);
+                var countResult = await this._executeQuery(sourceOptions, countSql, queryInfo.kind, queryInfo.data_source_id);
+                total = countResult && countResult[0] ? parseInt(countResult[0]._pivot_total || countResult[0].total || 0, 10) : 0;
+
+                // Grand total query: aggregate across ALL data (for grand total row)
+                var grandTotalSql = this._buildGrandTotalSql(originalSql, pivotConfig);
+                if (grandTotalSql) {
+                    try {
+                        var gtResult = await this._executeQuery(sourceOptions, grandTotalSql, queryInfo.kind, queryInfo.data_source_id);
+                        grandTotals = gtResult || [];
+                    } catch (_) { /* grand total is optional, don't fail */ }
+                }
+            }
+
+            return { data: rows, total: total, grand_totals: grandTotals, query_name: queryInfo.name };
         } catch (err) {
             // Re-throw with debug info
             var debugInfo = {
@@ -303,7 +323,7 @@ let PivotTableConfigService = class PivotTableConfigService {
         return opts.query || opts.sql || null;
     }
 
-    _buildPivotSql(originalSql, config) {
+    _buildPivotSql(originalSql, config, page, pageSize) {
         var rowFields = config.rowFields || [];
         var colFields = config.colFields || [];
         var valueField = config.valueField || '';
@@ -327,10 +347,61 @@ let PivotTableConfigService = class PivotTableConfigService {
         var groupBy = allGroupFields.map(function (f) { return escId(f); });
         var cleanSql = originalSql.replace(/;\s*$/, '');
 
-        return 'SELECT ' + selectParts.join(', ') + '\n' +
+        var sql = 'SELECT ' + selectParts.join(', ') + '\n' +
             'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
             'GROUP BY ' + groupBy.join(', ') + '\n' +
             'ORDER BY ' + groupBy.join(', ');
+
+        // Add LIMIT/OFFSET for backend pagination
+        if (pageSize && pageSize > 0) {
+            var offset = (page || 0) * pageSize;
+            sql += '\nLIMIT ' + parseInt(pageSize, 10) + ' OFFSET ' + parseInt(offset, 10);
+        }
+
+        return sql;
+    }
+
+    _buildPivotCountSql(originalSql, config) {
+        var rowFields = config.rowFields || [];
+        var colFields = config.colFields || [];
+        var allGroupFields = rowFields.concat(colFields);
+        if (allGroupFields.length === 0) return 'SELECT 0 AS `_pivot_total`';
+
+        var groupBy = allGroupFields.map(function (f) { return escId(f); });
+        var cleanSql = originalSql.replace(/;\s*$/, '');
+
+        return 'SELECT COUNT(*) AS `_pivot_total` FROM (\n' +
+            'SELECT 1 FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+            'GROUP BY ' + groupBy.join(', ') + '\n' +
+            ') AS `_pivot_cnt`';
+    }
+
+    _buildGrandTotalSql(originalSql, config) {
+        var colFields = config.colFields || [];
+        var valueField = config.valueField || '';
+        var aggregator = config.aggregator || 'count';
+        var cleanSql = originalSql.replace(/;\s*$/, '');
+        var aggFunc = AGG_SQL[aggregator] || 'COUNT(*)';
+
+        if (colFields.length > 0) {
+            // Grand total per column value + overall total
+            var selectParts = colFields.map(function (f) { return escId(f); });
+            if (aggregator === 'count' || !valueField) {
+                selectParts.push('COUNT(*) AS `_pivot_value`');
+            } else {
+                selectParts.push(aggFunc + '(' + escId(valueField) + ') AS `_pivot_value`');
+            }
+            var groupBy = colFields.map(function (f) { return escId(f); });
+
+            return 'SELECT ' + selectParts.join(', ') + '\n' +
+                'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+                'GROUP BY ' + groupBy.join(', ') + '\n' +
+                'ORDER BY ' + groupBy.join(', ');
+        } else {
+            // No column fields: just overall total
+            var valExpr = (aggregator === 'count' || !valueField) ? 'COUNT(*)' : aggFunc + '(' + escId(valueField) + ')';
+            return 'SELECT ' + valExpr + ' AS `_pivot_value` FROM (\n' + cleanSql + '\n) AS `_pivot_src`';
+        }
     }
 
     // ===================== INTERNAL: EXECUTE ON DATASOURCE =====================

@@ -30,7 +30,7 @@ let PivotTableConfigController = class PivotTableConfigController {
 
     // POST /pivot-table-config/execute
     async executePivot(dto) {
-        return this.pivotTableConfigService.executePivot(dto.app_version_id, dto.component_name, dto.config);
+        return this.pivotTableConfigService.executePivot(dto.app_version_id, dto.component_name, dto.config, dto.page, dto.page_size);
     }
 
     // GET /pivot-table-config/:appVersionId/:componentName

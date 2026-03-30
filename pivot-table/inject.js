@@ -215,12 +215,18 @@
   }
 
   // Execute backend pivot query (auto-detects query from component's data binding)
-  function executePivotAsync(componentName, config, callback) {
+  // page/pageSize are optional — if provided, backend adds LIMIT/OFFSET
+  function executePivotAsync(componentName, config, callback, page, pageSize) {
     var vid = detectAppVersionId();
-    if (!vid) { callback(new Error('App version not detected yet'), []); return; }
+    if (!vid) { callback(new Error('App version not detected yet'), [], null); return; }
+    var body = { app_version_id: vid, component_name: componentName, config: config };
+    if (pageSize && pageSize > 0) {
+      body.page = page || 0;
+      body.page_size = pageSize;
+    }
     apiFetch('/execute', {
       method: 'POST',
-      body: JSON.stringify({ app_version_id: vid, component_name: componentName, config: config }),
+      body: JSON.stringify(body),
     })
       .then(function (r) {
         if (!r.ok) {
@@ -233,8 +239,8 @@
         }
         return r.json();
       })
-      .then(function (result) { callback(null, result.data || []); })
-      .catch(function (err) { callback(err, []); });
+      .then(function (result) { callback(null, result.data || [], result.total, result.grand_totals); })
+      .catch(function (err) { callback(err, [], null, null); });
   }
 
   function defaultConfig() {
@@ -244,7 +250,7 @@
       showRowTotal: true, rowTotalLabel: 'Total',
       showGrandTotal: true, grandTotalLabel: 'Grand Total',
       showSubtotal: false, subtotalLabel: 'Subtotal',
-      backendPivot: false,
+      backendPivot: true,
       alignRowFields: 'left', alignColValues: 'right', alignRowTotal: 'right',
       alignGrandTotal: 'right', alignSubtotal: 'right',
       styleRowFields: 'bold', styleColValues: '', styleRowTotal: '',
@@ -753,7 +759,8 @@
   }
 
   // Bind pagination buttons — re-renders pivot on page change
-  function bindPaginationButtons(overlayEl, componentName, data, config, tableEl) {
+  // serverTotal: if not null, use backend pagination (re-fetch from API)
+  function bindPaginationButtons(overlayEl, componentName, data, config, tableEl, serverTotal) {
     var btns = overlayEl.querySelectorAll('.pivot-page-btn');
     for (var i = 0; i < btns.length; i++) {
       btns[i].addEventListener('click', function (e) {
@@ -762,20 +769,50 @@
         var page = parseInt(this.getAttribute('data-page'), 10);
         if (isNaN(page) || page < 0) return;
         setPivotPage(componentName, page);
-        // Re-render the overlay
-        overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, componentName);
-        bindDownloadButtons(overlayEl, componentName);
-        bindPaginationButtons(overlayEl, componentName, data, config, tableEl);
-        if (tableEl) adjustPivotHeight(tableEl, overlayEl);
-        // Scroll to top of pivot
-        var scroll = overlayEl.querySelector('.pivot-result-scroll');
-        if (scroll) scroll.scrollTop = 0;
+
+        var pageSize = config.pageSize || 0;
+
+        if (config.backendPivot && pageSize > 0) {
+          // Backend paging: re-fetch from API with new page
+          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty">Loading page ' + (page + 1) + '...</div>';
+          executePivotAsync(componentName, config, function (err, rows, total, grandTotals) {
+            if (err) {
+              overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>';
+              return;
+            }
+            var pData = rows.map(function (row) {
+              var r = {};
+              for (var k in row) {
+                if (k === '_pivot_value' || k === '_pivot_count') continue;
+                r[k] = row[k];
+              }
+              r[config.valueField || '_count'] = row['_pivot_value'];
+              return r;
+            });
+            overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals);
+            bindDownloadButtons(overlayEl, componentName);
+            bindPaginationButtons(overlayEl, componentName, pData, config, tableEl, total);
+            if (tableEl) adjustPivotHeight(tableEl, overlayEl);
+            var scroll = overlayEl.querySelector('.pivot-result-scroll');
+            if (scroll) scroll.scrollTop = 0;
+          }, page, pageSize);
+        } else {
+          // Frontend paging: re-render from local data
+          overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, componentName);
+          bindDownloadButtons(overlayEl, componentName);
+          bindPaginationButtons(overlayEl, componentName, data, config, tableEl);
+          if (tableEl) adjustPivotHeight(tableEl, overlayEl);
+          var scroll = overlayEl.querySelector('.pivot-result-scroll');
+          if (scroll) scroll.scrollTop = 0;
+        }
       });
     }
   }
 
   // ===================== RENDER PIVOT HTML =====================
-  function renderPivotHTML(data, config, componentName) {
+  // serverTotal: if provided, data is already paginated by backend (skip local slicing)
+  // serverGrandTotals: if provided, use for grand total row instead of computing from page data
+  function renderPivotHTML(data, config, componentName, serverTotal, serverGrandTotals) {
     var result = computePivot(data, config);
     var tree = result.tree;
     var colValues = result.colValues;
@@ -784,6 +821,7 @@
     var aggFn = AGG[config.aggregator]?.fn || AGG.count.fn;
     // Store component name for pagination state lookup
     config._componentName = componentName || config._componentName || '';
+    var _serverTotal = serverTotal; // null = frontend paging, number = backend paging
 
     if (rowKeys.length === 0) {
       return '<div class="pivot-empty">No data to pivot. Ensure the table has loaded data.</div>';
@@ -970,14 +1008,19 @@
 
     // ---- PAGINATION ----
     var pageSize = config.pageSize || 0; // 0 = all
-    var totalDataRows = rowKeys.length;
+    var isBackendPaged = _serverTotal !== null && _serverTotal !== undefined;
+    var totalDataRows = isBackendPaged ? _serverTotal : rowKeys.length;
     var totalPages = pageSize > 0 ? Math.ceil(totalDataRows / pageSize) : 1;
     var currentPage = getPivotPage(config._componentName || '') || 0;
     if (currentPage >= totalPages) currentPage = Math.max(0, totalPages - 1);
 
     // Determine which row keys to show on this page
     var pageRowKeys, pageRowGroups;
-    if (pageSize > 0) {
+    if (isBackendPaged) {
+      // Backend already returned only the current page's data — no slicing needed
+      pageRowKeys = rowKeys;
+      pageRowGroups = rowGroups;
+    } else if (pageSize > 0) {
       var startIdx = currentPage * pageSize;
       var endIdx = Math.min(startIdx + pageSize, totalDataRows);
       pageRowKeys = rowKeys.slice(startIdx, endIdx);
@@ -1015,27 +1058,60 @@
       }
     }
 
-    // Grand total row (always computed from ALL rows, not just current page)
+    // Grand total row
     if (showGrandTotal) {
       h += '<tr class="pivot-grand-total">';
       h += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aGT, sGT) + '>' + esc(grandTotalLabel) + '</td>';
-      if (showCols) {
-        for (var ck = 0; ck < colValues.length; ck++) {
-          var colTotal = [];
-          for (var rri = 0; rri < rowKeys.length; rri++) {
-            var cv = tree[rowKeys[rri]].cells[colValues[ck]] || [];
-            for (var vi = 0; vi < cv.length; vi++) colTotal.push(cv[vi]);
+
+      if (isBackendPaged && serverGrandTotals && serverGrandTotals.length > 0) {
+        // Use server-computed grand totals (accurate across ALL data, not just current page)
+        if (showCols) {
+          // Build lookup: colKey -> _pivot_value from server grand totals
+          var gtMap = {};
+          var gtOverall = 0;
+          for (var gti = 0; gti < serverGrandTotals.length; gti++) {
+            var gtRow = serverGrandTotals[gti];
+            var gtColParts = colFields.length ? colFields.map(function (f) { return gtRow[f] ?? '(empty)'; }) : [];
+            var gtKey = gtColParts.join('\x00');
+            gtMap[gtKey] = gtRow._pivot_value;
+            gtOverall += parseFloat(gtRow._pivot_value) || 0;
           }
-          h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + aggFn(colTotal) + '</td>';
+          for (var ck = 0; ck < colValues.length; ck++) {
+            var gtVal = gtMap[colValues[ck]];
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (gtVal !== undefined ? gtVal : esc(emptyVal)) + '</td>';
+          }
+        } else {
+          // No column fields: server returns single overall total
+          // (handled by showRowTotal below)
         }
-      }
-      if (showRowTotal) {
-        var grandVals = [];
-        for (var gvi = 0; gvi < rowKeys.length; gvi++) {
-          var gv = tree[rowKeys[gvi]].values;
-          for (var gvj = 0; gvj < gv.length; gvj++) grandVals.push(gv[gvj]);
+        if (showRowTotal) {
+          // Overall total: sum all grand total values
+          var gtSum = 0;
+          for (var gts = 0; gts < serverGrandTotals.length; gts++) {
+            gtSum += parseFloat(serverGrandTotals[gts]._pivot_value) || 0;
+          }
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + gtSum + '</td>';
         }
-        h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + aggFn(grandVals) + '</td>';
+      } else {
+        // Frontend computation (non-paginated or no server grand totals)
+        if (showCols) {
+          for (var ck = 0; ck < colValues.length; ck++) {
+            var colTotal = [];
+            for (var rri = 0; rri < rowKeys.length; rri++) {
+              var cv = tree[rowKeys[rri]].cells[colValues[ck]] || [];
+              for (var vi = 0; vi < cv.length; vi++) colTotal.push(cv[vi]);
+            }
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + aggFn(colTotal) + '</td>';
+          }
+        }
+        if (showRowTotal) {
+          var grandVals = [];
+          for (var gvi = 0; gvi < rowKeys.length; gvi++) {
+            var gv = tree[rowKeys[gvi]].values;
+            for (var gvj = 0; gvj < gv.length; gvj++) grandVals.push(gv[gvj]);
+          }
+          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + aggFn(grandVals) + '</td>';
+        }
       }
       h += '</tr>';
     }
@@ -1219,8 +1295,8 @@
       }
       h += '</select></div>';
 
-      // --- Backend Pivot section (auto-detected, hidden if not SQL datasource) ---
-      h += '<div class="pivot-backend-section" style="display:none">';
+      // --- Backend Pivot section (always visible, auto-detect controls editability) ---
+      h += '<div class="pivot-backend-section">';
       h += '<div class="pivot-section-label">Data Source</div>';
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Backend Pivot</label>';
@@ -1228,7 +1304,7 @@
       h += '<input type="checkbox" class="pivot-cfg-backendPivot"' + (config.backendPivot ? ' checked' : '') + '/>';
       h += '<span class="pivot-toggle-slider"></span>';
       h += '</label></div>';
-      h += '<div class="pivot-backend-info pivot-hint"></div>';
+      h += '<div class="pivot-backend-info pivot-hint">Detecting datasource...</div>';
       h += '</div>';
 
       // --- Totals section ---
@@ -1525,12 +1601,24 @@
             console.log(LOG_PREFIX, 'Backend detect result:', JSON.stringify(result));
             if (!result) return;
             if (result.supported) {
-              backendSection.style.display = '';
+              // Supported: enable toggle, show query info
+              if (backendCb) { backendCb.disabled = false; }
               if (backendInfo) backendInfo.textContent = 'Query: ' + (result.query_name || '?') + ' (' + result.kind + ')';
             } else {
-              backendSection.style.display = 'none';
-              if (backendCb) backendCb.checked = false;
-              if (backendInfo) backendInfo.textContent = result.reason || '';
+              // Not supported: force off, disable toggle, show reason
+              if (backendCb) {
+                backendCb.checked = false;
+                backendCb.disabled = true;
+              }
+              if (backendInfo) backendInfo.textContent = result.reason || 'Not supported';
+              // Update config to reflect forced-off state and re-render with frontend pivot
+              var cfg = getConfig(widgetName);
+              if (cfg.backendPivot) {
+                cfg.backendPivot = false;
+                setConfig(widgetName, cfg);
+                delete _backendPivotCache[widgetName];
+                if (cfg.enabled) updatePreview(widgetName, cfg);
+              }
             }
           })
           .catch(function () {});
@@ -1631,7 +1719,7 @@
 
       if (config.enabled && (config.rowFields.length > 0 || config.colFields.length > 0)) {
         // Helper to render pivot data into overlay
-        var renderIntoOverlay = function (data) {
+        var renderIntoOverlay = function (data, serverTotal, serverGrandTotals) {
           var ov = tableEl.querySelector('.pivot-overlay');
           var da = tableEl.querySelector('.jet-data-table');
           var ft = tableEl.querySelector('.jet-table-footer');
@@ -1644,9 +1732,9 @@
           if (da) da.style.display = 'none';
           if (ft) ft.style.display = 'none';
           ov.style.display = 'flex';
-          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, widgetName);
+          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, widgetName, serverTotal, serverGrandTotals);
           bindDownloadButtons(ov, widgetName);
-          bindPaginationButtons(ov, widgetName, data, config, tableEl);
+          bindPaginationButtons(ov, widgetName, data, config, tableEl, serverTotal);
           adjustPivotHeight(tableEl, ov);
         };
 
@@ -1667,7 +1755,9 @@
         if (config.backendPivot) {
           // Backend pivot: call server API directly (no need for query to run on frontend)
           showOverlayMsg('Loading pivot data from server...');
-          executePivotAsync(widgetName, config, function (err, rows) {
+          var bpPageSize = config.pageSize || 0;
+          var bpPage = bpPageSize > 0 ? getPivotPage(widgetName) : 0;
+          executePivotAsync(widgetName, config, function (err, rows, total, grandTotals) {
             if (err) {
               // Fallback to frontend pivot silently
               console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
@@ -1686,8 +1776,8 @@
               r[config.valueField || '_count'] = row['_pivot_value'];
               return r;
             });
-            renderIntoOverlay(data);
-          });
+            renderIntoOverlay(data, total, grandTotals);
+          }, bpPage, bpPageSize);
         } else {
           // Frontend pivot: extract from DOM
           extractDataAsync(tableEl, function (extracted) {
@@ -1828,20 +1918,28 @@
           }
 
           if (config.backendPivot) {
-            // Use cached data if available (avoid repeated API calls)
-            if (_backendPivotCache[name] && _backendPivotCache[name].data) {
-              var ov = ensureOverlay();
-              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(_backendPivotCache[name].data, config, name);
-              bindDownloadButtons(ov, name);
-              bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
-              return;
+            var kPageSize = config.pageSize || 0;
+            var kPage = kPageSize > 0 ? getPivotPage(name) : 0;
+            // Use cache if available (avoid repeated API calls / retry loops)
+            if (_backendPivotCache[name]) {
+              if (_backendPivotCache[name].failed) return; // failed before, don't retry (use frontend fallback)
+              if (_backendPivotCache[name].data && !kPageSize) {
+                var ov = ensureOverlay();
+                ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(_backendPivotCache[name].data, config, name);
+                bindDownloadButtons(ov, name);
+                bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
+                return;
+              }
             }
             // Fetch from backend (once, then cache)
             if (_backendPivotPending[name]) return; // already in-flight
             _backendPivotPending[name] = true;
-            executePivotAsync(name, config, function (err, rows) {
+            executePivotAsync(name, config, function (err, rows, total, grandTotals) {
               _backendPivotPending[name] = false;
               if (err) {
+                // Cache failure to prevent retry loop
+                _backendPivotCache[name] = { failed: true, timestamp: Date.now() };
+                console.warn(LOG_PREFIX, 'Backend pivot failed for', name, '- falling back to frontend:', err.message);
                 // Fallback: try frontend pivot for keeper
                 extractDataAsync(tableEl, function (extracted) {
                   if (extracted.data.length === 0) return;
@@ -1861,12 +1959,12 @@
                 r[config.valueField || '_count'] = row['_pivot_value'];
                 return r;
               });
-              _backendPivotCache[name] = { data: data, timestamp: Date.now() };
+              if (!kPageSize) _backendPivotCache[name] = { data: data, timestamp: Date.now() };
               var ov = ensureOverlay();
-              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name);
+              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, total, grandTotals);
               bindDownloadButtons(ov, name);
-              bindPaginationButtons(ov, name, data, config, tableEl);
-            });
+              bindPaginationButtons(ov, name, data, config, tableEl, total);
+            }, kPage, kPageSize);
           } else {
             // Frontend pivot: extract from DOM
             extractDataAsync(tableEl, function (extracted) {
@@ -1928,7 +2026,7 @@
       processedSet.add(tableEl);
       console.log(LOG_PREFIX, 'Applying pivot to', name, 'backendPivot:', !!config.backendPivot);
 
-      function renderPivot(data) {
+      function renderPivot(data, serverTotal, serverGrandTotals) {
         var dataArea = tableEl.querySelector('.jet-data-table');
         var footer = tableEl.querySelector('.jet-table-footer');
         if (dataArea) dataArea.style.display = 'none';
@@ -1942,10 +2040,10 @@
           else tableEl.appendChild(overlay);
         }
 
-        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name);
+        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, serverTotal, serverGrandTotals);
         overlay.style.display = 'flex';
         bindDownloadButtons(overlay, name);
-        bindPaginationButtons(overlay, name, data, config, tableEl);
+        bindPaginationButtons(overlay, name, data, config, tableEl, serverTotal);
         adjustPivotHeight(tableEl, overlay);
       }
 
@@ -1972,6 +2070,9 @@
       if (config.backendPivot) {
         showLoading();
 
+        var vPageSize = config.pageSize || 0;
+        var vPage = vPageSize > 0 ? getPivotPage(name) : 0;
+
         // Retry backend pivot (version ID might not be captured yet in viewer)
         var backendAttempts = 0;
         var maxBackendAttempts = 10;
@@ -1982,7 +2083,7 @@
             setTimeout(tryBackendPivot, 1000);
             return;
           }
-          executePivotAsync(name, config, function (err, rows) {
+          executePivotAsync(name, config, function (err, rows, total, grandTotals) {
             if (err) {
               if (backendAttempts < maxBackendAttempts && err.message && err.message.indexOf('version not detected') !== -1) {
                 setTimeout(tryBackendPivot, 1000);
@@ -2008,9 +2109,9 @@
             r[config.valueField || '_count'] = row['_pivot_value'];
             return r;
           });
-          console.log(LOG_PREFIX, 'Backend pivot rendered:', name, data.length, 'rows');
-          renderPivot(data);
-          });
+          console.log(LOG_PREFIX, 'Backend pivot rendered:', name, data.length, 'rows', 'total:', total);
+          renderPivot(data, total, grandTotals);
+          }, vPage, vPageSize);
         }
         tryBackendPivot();
         return;

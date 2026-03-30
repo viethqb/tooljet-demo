@@ -206,6 +206,15 @@
   transform: translateX(14px);
 }
 
+.pivot-toggle-switch input:disabled + .pivot-toggle-slider {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pivot-toggle-switch:has(input:disabled) {
+  cursor: not-allowed;
+}
+
 /* Select dropdown */
 .pivot-cfg-select {
   width: 100%;
