@@ -454,29 +454,45 @@ let PivotTableConfigService = class PivotTableConfigService {
         selectParts.push('COUNT(*) AS `_pivot_count`');
 
         var groupBy = allGroupFields.map(function (f) { return escId(f); });
+        var rowGroupBy = rowFields.map(function (f) { return escId(f); });
         var cleanSql = originalSql.replace(/;\s*$/, '');
 
-        var sql = 'SELECT ' + selectParts.join(', ') + '\n' +
+        // Base grouped query (no pagination)
+        var baseSql = 'SELECT ' + selectParts.join(', ') + '\n' +
             'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
-            'GROUP BY ' + groupBy.join(', ') + '\n' +
-            'ORDER BY ' + groupBy.join(', ');
+            'GROUP BY ' + groupBy.join(', ');
 
-        // Add LIMIT/OFFSET for backend pagination
-        if (pageSize && pageSize > 0) {
+        // Pagination: use DENSE_RANK on rowFields to keep all cells of one row key on same page
+        if (pageSize && pageSize > 0 && rowFields.length > 0 && colFields.length > 0) {
+            var rankOrder = rowGroupBy.join(', ');
+            var rankedParts = selectParts.slice();
+            rankedParts.push('DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS `_pivot_row_rank`');
+
+            var rankedSql = 'SELECT ' + rankedParts.join(', ') + '\n' +
+                'FROM (\n' + cleanSql + '\n) AS `_pivot_src`\n' +
+                'GROUP BY ' + groupBy.join(', ');
+
             var offset = (page || 0) * pageSize;
-            sql += '\nLIMIT ' + parseInt(pageSize, 10) + ' OFFSET ' + parseInt(offset, 10);
+            return 'SELECT * FROM (\n' + rankedSql + '\n) AS `_pivot_page`\n' +
+                'WHERE `_pivot_row_rank` > ' + parseInt(offset, 10) +
+                ' AND `_pivot_row_rank` <= ' + parseInt(offset + pageSize, 10) + '\n' +
+                'ORDER BY ' + groupBy.join(', ');
+        } else if (pageSize && pageSize > 0) {
+            // No colFields: each grouped row = one visual row, simple LIMIT/OFFSET
+            var offset = (page || 0) * pageSize;
+            return baseSql + '\nORDER BY ' + groupBy.join(', ') +
+                '\nLIMIT ' + parseInt(pageSize, 10) + ' OFFSET ' + parseInt(offset, 10);
         }
 
-        return sql;
+        return baseSql + '\nORDER BY ' + groupBy.join(', ');
     }
 
     _buildPivotCountSql(originalSql, config) {
         var rowFields = config.rowFields || [];
-        var colFields = config.colFields || [];
-        var allGroupFields = rowFields.concat(colFields);
-        if (allGroupFields.length === 0) return 'SELECT 0 AS `_pivot_total`';
+        if (rowFields.length === 0) return 'SELECT 0 AS `_pivot_total`';
 
-        var groupBy = allGroupFields.map(function (f) { return escId(f); });
+        // Count distinct row keys (visual rows), not all GROUP BY combinations
+        var groupBy = rowFields.map(function (f) { return escId(f); });
         var cleanSql = originalSql.replace(/;\s*$/, '');
 
         return 'SELECT COUNT(*) AS `_pivot_total` FROM (\n' +

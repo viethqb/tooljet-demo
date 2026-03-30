@@ -809,7 +809,7 @@
             var pData = rows.map(function (row) {
               var r = {};
               for (var k in row) {
-                if (k === '_pivot_value') continue;
+                if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
                 r[k] = row[k];
               }
               r[config.valueField || '_count'] = row['_pivot_value'];
@@ -1894,7 +1894,7 @@
             var data = rows.map(function (row) {
               var r = {};
               for (var k in row) {
-                if (k === '_pivot_value') continue;
+                if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
                 r[k] = row[k];
               }
               r[config.valueField || '_count'] = row['_pivot_value'];
@@ -2124,7 +2124,7 @@
               var data = rows.map(function (row) {
                 var r = {};
                 for (var k in row) {
-                  if (k === '_pivot_value') continue;
+                  if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
                   r[k] = row[k];
                 }
                 r[config.valueField || '_count'] = row['_pivot_value'];
@@ -2275,7 +2275,7 @@
           var data = rows.map(function (row) {
             var r = {};
             for (var k in row) {
-              if (k === '_pivot_value') continue;
+              if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
               r[k] = row[k];
             }
             r[config.valueField || '_count'] = row['_pivot_value'];
