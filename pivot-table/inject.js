@@ -543,8 +543,18 @@
         // Set min-height on the table widget container so dynamic height works
         var header = tableEl.querySelector('.table-card-header');
         var headerH = header ? header.offsetHeight : 0;
-        tableEl.style.minHeight = (pivotH + headerH + 4) + 'px';
+        var totalH = pivotH + headerH + 4;
+        tableEl.style.minHeight = totalH + 'px';
         tableEl.style.height = 'auto';
+        tableEl.style.overflow = 'visible';
+
+        // Also adjust parent wrapper (react-grid-layout item) if it constrains height
+        var parent = tableEl.parentElement;
+        if (parent && parent.style && parent.style.height) {
+          parent.style.height = totalH + 'px';
+          parent.style.minHeight = totalH + 'px';
+          parent.style.overflow = 'visible';
+        }
       }
     });
   }

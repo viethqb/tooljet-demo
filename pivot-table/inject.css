@@ -338,6 +338,7 @@
 .jet-table.table-component:has(.pivot-overlay[style*="display: flex"]) {
   height: auto !important;
   min-height: auto !important;
+  overflow: visible !important;
 }
 
 .pivot-overlay {
