@@ -26,17 +26,17 @@ let PivotTableConfigController = class PivotTableConfigController {
 
     // POST /pivot-table-config/detect
     async detectDataSource(user, dto) {
-        return this.pivotTableConfigService.detectDataSource(user, dto.app_version_id, dto.component_name);
+        return this.pivotTableConfigService.detectDataSource(user, dto.app_version_id, dto.component_name, dto.component_id);
     }
 
     // POST /pivot-table-config/execute
     async executePivot(user, dto) {
-        return this.pivotTableConfigService.executePivot(user, dto.app_version_id, dto.component_name, dto.config, dto.page, dto.page_size);
+        return this.pivotTableConfigService.executePivot(user, dto.app_version_id, dto.component_name, dto.config, dto.page, dto.page_size, dto.component_id);
     }
 
-    // GET /pivot-table-config/:appVersionId/:componentName
-    async getConfig(user, appVersionId, componentName) {
-        return this.pivotTableConfigService.getConfig(user, appVersionId, componentName);
+    // GET /pivot-table-config/:appVersionId/:componentName?component_id=UUID
+    async getConfig(user, appVersionId, componentName, componentId) {
+        return this.pivotTableConfigService.getConfig(user, appVersionId, componentName, componentId);
     }
 
     // GET /pivot-table-config/:appVersionId
@@ -73,8 +73,9 @@ __decorate([
     __param(0, (0, user_decorator_1.User)()),
     __param(1, (0, common_1.Param)('appVersionId')),
     __param(2, (0, common_1.Param)('componentName')),
+    __param(3, (0, common_1.Query)('component_id')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [Object, String, String]),
+    __metadata("design:paramtypes", [Object, String, String, String]),
     __metadata("design:returntype", Promise)
 ], PivotTableConfigController.prototype, "getConfig", null);
 __decorate([

@@ -40,6 +40,7 @@ COPY pivot-table-config/dist/module.js /app/server/dist/src/modules/pivot-table-
 COPY pivot-table-config/dist/ee/ /app/server/dist/ee/pivot-table-config/
 COPY pivot-table-config/dist/migrations/1760100000000-CreatePivotTableConfig.js /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js
 COPY pivot-table-config/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js /app/server/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js
+COPY pivot-table-config/dist/migrations/1760300000000-CleanupOrphanedPivotConfigs.js /app/server/dist/migrations/1760300000000-CleanupOrphanedPivotConfigs.js
 
 COPY pivot-table-config/patch-app-module.js /tmp/patch-app-module.js
 RUN node /tmp/patch-app-module.js && rm /tmp/patch-app-module.js
@@ -47,6 +48,15 @@ RUN node /tmp/patch-app-module.js && rm /tmp/patch-app-module.js
 # ===================== Pivot Table: Frontend Injection =====================
 COPY pivot-table/inject.js /app/pivot-table/inject.js
 COPY pivot-table/inject.css /app/pivot-table/inject.css
+
+# ===================== Workflow Packages: Build bundle at image build time =====================
+COPY workflow-packages/build.js /tmp/build-workflow-packages.js
+RUN cd /app/server && node /tmp/build-workflow-packages.js && \
+    rm /tmp/build-workflow-packages.js && \
+    rm -rf /tmp/.npm /tmp/wf-pkg-build
+
+COPY workflow-packages/patch-bundle-service.js /tmp/patch-bundle-service.js
+RUN node /tmp/patch-bundle-service.js && rm /tmp/patch-bundle-service.js
 
 # ===================== Permissions =====================
 RUN chown -R appuser:0 /app/server/dist/ee/licensing/configs/License.js && \
@@ -58,8 +68,10 @@ RUN chown -R appuser:0 /app/server/dist/ee/licensing/configs/License.js && \
     chown -R appuser:0 /app/server/dist/ee/pivot-table-config/ && \
     chown -R appuser:0 /app/server/dist/migrations/1760100000000-CreatePivotTableConfig.js && \
     chown -R appuser:0 /app/server/dist/migrations/1760200000000-AddComponentIdToPivotConfig.js && \
+    chown -R appuser:0 /app/server/dist/migrations/1760300000000-CleanupOrphanedPivotConfigs.js && \
     chown -R appuser:0 /app/query-folders/ && \
-    chown -R appuser:0 /app/pivot-table/
+    chown -R appuser:0 /app/pivot-table/ && \
+    chown -R appuser:0 /app/workflow-packages/
 
 USER appuser
 

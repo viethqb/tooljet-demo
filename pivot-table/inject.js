@@ -139,9 +139,10 @@
     }, options || {}));
   }
 
-  // localStorage fallback
+  // localStorage fallback — use component_id in key when available for multi-page safety
   function storageKey(name) {
-    return 'pivot__' + appSlug + '__' + name;
+    var cid = _componentIdMap[name];
+    return 'pivot__' + appSlug + '__' + (cid || name);
   }
 
   function saveConfigLocal(name, config) {
@@ -151,18 +152,27 @@
   function loadConfigLocal(name) {
     try {
       var raw = localStorage.getItem(storageKey(name));
-      return raw ? JSON.parse(raw) : null;
+      if (raw) return JSON.parse(raw);
+      // Only fallback to legacy key if we DON'T have a component_id
+      // (means component_id hasn't been captured yet — true migration scenario)
+      if (!_componentIdMap[name]) {
+        var legacyRaw = localStorage.getItem('pivot__' + appSlug + '__' + name);
+        return legacyRaw ? JSON.parse(legacyRaw) : null;
+      }
+      return null;
     } catch (_) { return null; }
   }
 
   // Save to API (fire-and-forget) + localStorage backup
-  function saveConfig(name, config) {
+  function saveConfig(name, config, componentId) {
     saveConfigLocal(name, config);
     var vid = detectAppVersionId();
     if (!vid) return;
+    var payload = { app_version_id: vid, component_name: name, config: config };
+    if (componentId) payload.component_id = componentId;
     apiFetch('', {
       method: 'PUT',
-      body: JSON.stringify({ app_version_id: vid, component_name: name, config: config }),
+      body: JSON.stringify(payload),
     }).catch(function (err) { console.warn(LOG_PREFIX, 'API save failed:', err.message); });
   }
 
@@ -175,7 +185,9 @@
   function loadConfigAsync(name, callback) {
     var vid = detectAppVersionId();
     if (!vid) { callback(loadConfigLocal(name)); return; }
-    apiFetch('/' + vid + '/' + encodeURIComponent(name))
+    var cid = _componentIdMap[name];
+    var url = '/' + vid + '/' + encodeURIComponent(name) + (cid ? '?component_id=' + cid : '');
+    apiFetch(url)
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
         if (data && data.config) {
@@ -194,6 +206,8 @@
   }
 
   // Async: load ALL configs for viewer mode (single API call)
+  // Backend returns { configs: { componentId: { config, name, component_id } } }
+  // We build a map: componentName -> config, and componentId -> componentName for multi-page
   function loadAllConfigsAsync(callback) {
     var vid = detectAppVersionId();
     if (!vid) { callback({}); return; }
@@ -201,12 +215,30 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
         if (data && data.configs) {
-          // Sync all to localStorage
+          var result = {};
           var keys = Object.keys(data.configs);
           for (var i = 0; i < keys.length; i++) {
-            saveConfigLocal(keys[i], data.configs[keys[i]]);
+            var entry = data.configs[keys[i]];
+            // New format: { config, name, component_id }
+            if (entry && entry.config && entry.name) {
+              var cfgName = entry.name;
+              // Use component_id as key if available (multi-page safe)
+              if (entry.component_id) {
+                _componentIdMap[cfgName] = _componentIdMap[cfgName] || entry.component_id;
+                // If same name exists, suffix with page context to avoid collision
+                if (result[cfgName]) {
+                  cfgName = cfgName + '__' + entry.component_id.substring(0, 8);
+                }
+              }
+              result[cfgName] = entry.config;
+              saveConfigLocal(cfgName, entry.config);
+            } else {
+              // Legacy format: config directly
+              result[keys[i]] = entry;
+              saveConfigLocal(keys[i], entry);
+            }
           }
-          callback(data.configs);
+          callback(result);
         } else {
           callback({});
         }
@@ -220,6 +252,7 @@
     var vid = detectAppVersionId();
     if (!vid) { callback(new Error('App version not detected yet'), [], null); return; }
     var body = { app_version_id: vid, component_name: componentName, config: config };
+    if (_componentIdMap[componentName]) body.component_id = _componentIdMap[componentName];
     if (pageSize && pageSize > 0) {
       body.page = page || 0;
       body.page_size = pageSize;
@@ -249,7 +282,7 @@
       showTitle: true, titleAlias: '',
       showRowTotal: true, rowTotalLabel: 'Total',
       showGrandTotal: true, grandTotalLabel: 'Grand Total',
-      showSubtotal: false, subtotalLabel: 'Subtotal',
+      showSubtotal: false, subtotalLabel: '{group} Subtotal',
       backendPivot: true,
       alignRowFields: 'left', alignColValues: 'right', alignRowTotal: 'right',
       alignGrandTotal: 'right', alignSubtotal: 'right',
@@ -286,6 +319,7 @@
   // Cache per component name — survives display:none (virtualized table renders 0 rows when hidden)
   var CACHE_TTL = 5 * 60 * 1000; // 5 minutes
   var dataCache = {}; // componentName -> { columns: [], data: [], _ts: timestamp }
+  var _componentIdMap = {}; // componentName -> component UUID (for multi-page unique identification)
 
   // Evict stale caches periodically
   setInterval(function () {
@@ -299,6 +333,34 @@
     var m = cy.match(/^draggable-widget-(.+)$/);
     return m ? m[1] : null;
   }
+
+  // Get component UUID from React fiber (for unique identification across pages)
+  function getComponentId(tableEl) {
+    if (!tableEl) return null;
+    try {
+      var fiberKey = Object.keys(tableEl).find(function (k) { return k.startsWith('__reactFiber'); });
+      if (!fiberKey) return null;
+      var fiber = tableEl[fiberKey];
+      for (var i = 0; i < 20 && fiber; i++) {
+        var props = fiber.memoizedProps || fiber.pendingProps;
+        if (props) {
+          // Direct UUID props
+          if (props.id && typeof props.id === 'string' && props.id.match(/^[a-f0-9-]{36}$/)) return props.id;
+          if (props.componentId && typeof props.componentId === 'string' && props.componentId.match(/^[a-f0-9-]{36}$/)) return props.componentId;
+          // Nested component object
+          if (props.component && props.component.id && typeof props.component.id === 'string') return props.component.id;
+          // ToolJet widget props
+          if (props.widgetId && typeof props.widgetId === 'string' && props.widgetId.match(/^[a-f0-9-]{36}$/)) return props.widgetId;
+        }
+        fiber = fiber.return;
+      }
+    } catch (_) {}
+    // Fallback: try data attribute
+    var cid = tableEl.getAttribute('data-component-id');
+    if (cid) return cid;
+    return null;
+  }
+
 
   // Build a map of DOM column index → header display name (alias / "Column name")
   // Skips checkbox and action columns, matching <th> and <td> by their actual DOM index
@@ -843,7 +905,7 @@
   function renderPivotHTML(data, config, componentName, serverTotal, serverGrandTotals) {
     var result = computePivot(data, config);
     var tree = result.tree;
-    var countTree = result.countTree;
+    var countTree = result.countTree || {};
     var colValues = result.colValues;
     var rowKeys = result.rowKeys;
     var rowFieldValues = result.rowFieldValues;
@@ -883,7 +945,7 @@
     var showGrandTotal = config.showGrandTotal !== false;
     var grandTotalLabel = config.grandTotalLabel || 'Grand Total';
     var showSubtotal = config.showSubtotal && rowFields.length > 1;
-    var subtotalLabel = config.subtotalLabel || 'Subtotal';
+    var subtotalLabel = config.subtotalLabel || '{group} Subtotal';
     var numRowCols = rowFields.length || 1;
     var numColFields = colFields.length || 0;
 
@@ -1043,8 +1105,9 @@
 
     // Render subtotal row for a group
     function renderSubtotalRow(groupKeys, groupLabel) {
+      var stLabel = subtotalLabel.replace(/\{group\}/gi, groupLabel || '');
       var r = '<tr class="pivot-subtotal">';
-      r += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aST, sST) + '>' + esc(subtotalLabel) + '</td>';
+      r += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aST, sST) + '>' + esc(stLabel) + '</td>';
       if (showCols) {
         for (var sc = 0; sc < colValues.length; sc++) {
           var subVals = [], subCnts = [];
@@ -1137,13 +1200,11 @@
         if (showCols) {
           // Build lookup: colKey -> _pivot_value from server grand totals
           var gtMap = {};
-          var gtOverall = 0;
           for (var gti = 0; gti < serverGrandTotals.length; gti++) {
             var gtRow = serverGrandTotals[gti];
             var gtColParts = colFields.length ? colFields.map(function (f) { return gtRow[f] ?? '(empty)'; }) : [];
             var gtKey = gtColParts.join('\x00');
             gtMap[gtKey] = gtRow._pivot_value;
-            gtOverall += parseFloat(gtRow._pivot_value) || 0;
           }
           for (var ck = 0; ck < colValues.length; ck++) {
             var gtVal = gtMap[colValues[ck]];
@@ -1165,7 +1226,22 @@
               gtSumCnt += gtc;
             }
             gtDisplay = gtSumCnt > 0 ? (gtSumProd / gtSumCnt) : 0;
+          } else if (config.aggregator === 'min') {
+            gtDisplay = Infinity;
+            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
+              var gtv2 = parseFloat(serverGrandTotals[gts2]._pivot_value);
+              if (!isNaN(gtv2) && gtv2 < gtDisplay) gtDisplay = gtv2;
+            }
+            if (gtDisplay === Infinity) gtDisplay = 0;
+          } else if (config.aggregator === 'max') {
+            gtDisplay = -Infinity;
+            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
+              var gtv2 = parseFloat(serverGrandTotals[gts2]._pivot_value);
+              if (!isNaN(gtv2) && gtv2 > gtDisplay) gtDisplay = gtv2;
+            }
+            if (gtDisplay === -Infinity) gtDisplay = 0;
           } else {
+            // sum, count: sum of per-column values
             var gtSum = 0;
             for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
               gtSum += parseFloat(serverGrandTotals[gts2]._pivot_value) || 0;
@@ -1229,6 +1305,7 @@
   if (isEditor) {
     var SECTION_ID = 'pivot-inspector-section';
     var activeWidget = null;
+    var _activeComponentId = null; // track component UUID to detect page switches with same name
     var _configLoadPending = false;
     var _configRetryCount = 0;
     var _previousWidget = null; // track previous widget for rename detection
@@ -1248,7 +1325,7 @@
     // Set config: update memory + localStorage
     function setConfig(widgetName, config) {
       configCache[widgetName] = config;
-      saveConfig(widgetName, config);
+      saveConfig(widgetName, config, _componentIdMap[widgetName]);
     }
 
     // Get currently selected widget name from Inspector
@@ -1257,9 +1334,16 @@
       return input ? input.value.trim() : null;
     }
 
-    // Check if currently selected component is a Table (has "Data" accordion section)
+    // Check if currently selected component is a Table
     function isTableInspector() {
-      return !!document.querySelector('[data-cy="widget-accordion-data"]');
+      var name = getWidgetName();
+      if (!name) return false;
+      // Check canvas element has .table-component class (unique to Table widget)
+      var el = document.querySelector('[data-cy="draggable-widget-' + name + '"]');
+      if (el && el.querySelector('.jet-table.table-component')) return true;
+      // Fallback: check if element itself has table-component
+      if (el && el.classList && el.classList.contains('table-component')) return true;
+      return false;
     }
 
     // Find the .accordion container inside the Properties tab
@@ -1269,6 +1353,41 @@
       var item = dataSection.closest('.accordion-item');
       if (!item) return null;
       return item.parentElement; // the .accordion div
+    }
+
+    // When pivot is enabled, inject a <style> tag that hides Table UI elements
+    // Uses data-cy selector which React doesn't remove on re-render
+    var _pivotStyleTags = {}; // componentId -> style element
+
+    function applyTableOverrides(pivotEnabled) {
+      var cid = _activeComponentId;
+      var wname = activeWidget;
+      if (!wname) return;
+
+      // Remove existing style tag for this component
+      if (_pivotStyleTags[cid || wname]) {
+        _pivotStyleTags[cid || wname].remove();
+        delete _pivotStyleTags[cid || wname];
+      }
+
+      if (!pivotEnabled) return;
+
+      // Inject CSS targeting this specific widget
+      var selector = '[data-cy="draggable-widget-' + wname + '"]';
+      var css = selector + ' .table-card-header,' +
+        selector + ' .table-global-search,' +
+        selector + ' [data-cy$="-filter-button"],' +
+        selector + ' [data-cy$="-search-bar"],' +
+        selector + ' .jet-table-footer,' +
+        selector + ' .table-footer,' +
+        selector + ' .table-footer-section,' +
+        selector + ' .pagination-section' +
+        '{ display: none !important; }';
+      var style = document.createElement('style');
+      style.textContent = css;
+      style.setAttribute('data-pivot-override', wname);
+      document.head.appendChild(style);
+      _pivotStyleTags[cid || wname] = style;
     }
 
     // Refresh column list from the table on the canvas
@@ -1429,21 +1548,18 @@
       h += '<input type="text" class="pivot-cfg-input pivot-cfg-grandTotalLabel" value="' + esc(config.grandTotalLabel || 'Grand Total') + '" placeholder="Grand Total"/>';
       h += '</div>';
 
-      // Subtotals (rows grouped by first field) — disabled for backend pivot
-      var subtotalDisabled = config.backendPivot ? ' disabled' : '';
+      // Subtotals (rows grouped by first field)
       h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Subtotals</label>';
       h += '<label class="pivot-toggle-switch">';
-      h += '<input type="checkbox" class="pivot-cfg-showSubtotal"' + (config.showSubtotal && !config.backendPivot ? ' checked' : '') + subtotalDisabled + '/>';
+      h += '<input type="checkbox" class="pivot-cfg-showSubtotal"' + (config.showSubtotal ? ' checked' : '') + '/>';
       h += '<span class="pivot-toggle-slider"></span>';
       h += '</label></div>';
-      if (config.backendPivot) {
-        h += '<div class="pivot-prop-row"><span style="font-size:11px;color:#888;">Subtotals not available with backend pivot</span></div>';
-      }
-      h += '<div class="pivot-prop-row"' + (config.backendPivot ? ' style="display:none"' : '') + '>';
+      h += '<div class="pivot-prop-row">';
       h += '<label class="pivot-prop-label">Label</label>';
-      h += '<input type="text" class="pivot-cfg-input pivot-cfg-subtotalLabel" value="' + esc(config.subtotalLabel || 'Subtotal') + '" placeholder="Subtotal"/>';
+      h += '<input type="text" class="pivot-cfg-input pivot-cfg-subtotalLabel" value="' + esc(config.subtotalLabel || '{group} Subtotal') + '" placeholder="{group} Subtotal"/>';
       h += '</div>';
+      h += '<div class="pivot-prop-row"><span style="font-size:11px;color:#888;line-height:1.3">Use <b>{group}</b> for group name.<br>E.g: <i>{group} Subtotal</i>, <i>Subtotal of {group}</i>, <i>Total ({group})</i></span></div>';
 
       // --- Alignment & Style section ---
       // Empty cell display
@@ -1611,7 +1727,7 @@
       var showSubtotal = section.querySelector('.pivot-cfg-showSubtotal');
       if (showSubtotal) config.showSubtotal = showSubtotal.checked;
       var subtotalInp = section.querySelector('.pivot-cfg-subtotalLabel');
-      if (subtotalInp) config.subtotalLabel = subtotalInp.value || 'Subtotal';
+      if (subtotalInp) config.subtotalLabel = subtotalInp.value || '{group} Subtotal';
 
       var backendCb = section.querySelector('.pivot-cfg-backendPivot');
       if (backendCb) config.backendPivot = backendCb.checked;
@@ -1707,6 +1823,9 @@
         var fields = section.querySelector('.pivot-cfg-fields');
         if (fields) fields.style.display = config.enabled ? '' : 'none';
 
+        // Hide/show other Table config sections
+        applyTableOverrides(config.enabled);
+
         updatePreview(widgetName, config);
       }
 
@@ -1728,7 +1847,7 @@
       if (detVid && backendSection) {
         apiFetch('/detect', {
           method: 'POST',
-          body: JSON.stringify({ app_version_id: detVid, component_name: widgetName }),
+          body: JSON.stringify({ app_version_id: detVid, component_name: widgetName, component_id: _componentIdMap[widgetName] || undefined }),
         })
           .then(function (r) {
             console.log(LOG_PREFIX, 'Backend detect response status:', r.status);
@@ -1863,7 +1982,18 @@
 
     // ---- CANVAS PREVIEW ----
     function updatePreview(widgetName, config) {
-      var tableEl = document.querySelector('[data-cy="draggable-widget-' + widgetName + '"]');
+      // Find the correct table element (match by component_id when multiple same-name exist)
+      var tableEl = null;
+      var candidates = document.querySelectorAll('[data-cy="draggable-widget-' + widgetName + '"]');
+      if (candidates.length === 1) {
+        tableEl = candidates[0];
+      } else if (candidates.length > 1 && _activeComponentId) {
+        for (var ci = 0; ci < candidates.length; ci++) {
+          var cid = getComponentId(candidates[ci]);
+          if (cid === _activeComponentId) { tableEl = candidates[ci]; break; }
+        }
+      }
+      if (!tableEl && candidates.length > 0) tableEl = candidates[0];
       if (!tableEl) return;
 
       var dataArea = tableEl.querySelector('.jet-data-table');
@@ -1958,8 +2088,10 @@
       if (overlay) overlay.remove();
     }
 
-    // ---- MAIN POLLING LOOP (500ms) ----
+    // ---- MAIN POLLING LOOP (500ms) — inspector + canvas overlay keeper combined ----
     var forceReinject = false;
+    var _backendPivotCache = {}; // componentName -> { html, timestamp }
+    var _backendPivotPending = {}; // componentName -> true (request in-flight)
 
     setInterval(function () {
       var isTable = isTableInspector();
@@ -1974,32 +2106,46 @@
         return;
       }
 
-      // Case 2: Different widget selected (or renamed)
-      if (widgetName !== activeWidget) {
+      // Detect current component UUID (even before widget change detection)
+      var _curTableEl = document.querySelector('[data-cy="draggable-widget-' + widgetName + '"]');
+      var _curCid = _curTableEl ? getComponentId(_curTableEl) : null;
+      var componentChanged = _curCid && _activeComponentId && _curCid !== _activeComponentId;
 
-        // Carry config from old name to new name if new name has no config
-        // Handles both rename and intermediate typing states
+      // Case 2: Different widget selected (or renamed, or same name on different page)
+      if (widgetName !== activeWidget || componentChanged) {
+
+        // Carry config from old name to new name if new name has no config (rename only, not page switch)
         var isRename = false;
-        if (activeWidget && configCache[activeWidget] && !configCache[widgetName]) {
+        if (!componentChanged && activeWidget && configCache[activeWidget] && !configCache[widgetName]) {
           isRename = true;
           configCache[widgetName] = configCache[activeWidget];
           saveConfigLocal(widgetName, configCache[widgetName]);
           // Save to API (creates row with new name in DB)
-          saveConfig(widgetName, configCache[widgetName]);
+          saveConfig(widgetName, configCache[widgetName], _componentIdMap[activeWidget] || _componentIdMap[widgetName]);
           // Retry after 2s + 5s (ToolJet DB name commit may lag)
           var _carryName = widgetName;
-          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName]); }, 2000);
-          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName]); }, 5000);
+          var _carryCid = _componentIdMap[activeWidget] || _componentIdMap[widgetName];
+          if (_componentIdMap[activeWidget]) _componentIdMap[widgetName] = _componentIdMap[activeWidget];
+          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName], _carryCid); }, 2000);
+          setTimeout(function () { if (configCache[_carryName]) saveConfig(_carryName, configCache[_carryName], _carryCid); }, 5000);
           console.log(LOG_PREFIX, 'Config carried:', activeWidget, '→', widgetName);
         }
 
         _previousWidget = activeWidget;
         if (section) section.remove();
         activeWidget = widgetName;
+        _activeComponentId = _curCid;
+        if (_curCid) _componentIdMap[widgetName] = _curCid;
         section = null;
         _configRetryCount = 0;
         refreshColumns(widgetName);
-        console.log(LOG_PREFIX, 'Table selected:', widgetName, 'columns:', cachedColumns);
+        console.log(LOG_PREFIX, 'Table selected:', widgetName, 'id:', _activeComponentId || 'N/A', 'columns:', cachedColumns);
+
+        // On page switch (same name, different component), clear cached config to force reload
+        if (componentChanged) {
+          delete configCache[widgetName];
+          console.log(LOG_PREFIX, 'Page switch detected, clearing config cache for', widgetName);
+        }
 
         // Pre-fetch config from API (updates cache + localStorage, then re-inject)
         if (!configCache[widgetName] && !_configLoadPending) {
@@ -2074,20 +2220,21 @@
       // Show preview if enabled
       if (config.enabled) updatePreview(widgetName, config);
 
-    }, 500);
+      // Hide other Table config sections when pivot is enabled
+      applyTableOverrides(config.enabled);
 
-    // ---- CANVAS OVERLAY KEEPER ----
-    // Keeps pivot overlays alive when React re-renders canvas.
-    // For backend pivot: caches result to avoid repeated API calls.
-    var _backendPivotCache = {}; // componentName -> { html, timestamp }
-    var _backendPivotPending = {}; // componentName -> true (request in-flight)
-
-    setInterval(function () {
+      // ---- CANVAS OVERLAY KEEPER (inline, same loop) ----
+      (function keepOverlays() {
       var tables = document.querySelectorAll('.jet-table.table-component');
       for (var i = 0; i < tables.length; i++) {
         (function (tableEl) {
           var name = getComponentName(tableEl);
           if (!name) return;
+
+          // Only apply to the component that owns this config (match by component_id)
+          var elCid = getComponentId(tableEl);
+          var cachedCid = _componentIdMap[name];
+          if (elCid && cachedCid && elCid !== cachedCid) return; // different component with same name, skip
 
           var config = configCache[name] || loadConfig(name);
           if (!config || !config.enabled) return;
@@ -2179,7 +2326,9 @@
           }
         })(tables[i]);
       }
-    }, 800);
+      })(); // end keepOverlays
+
+    }, 500);
   }
 
   // =====================================================================
@@ -2213,8 +2362,14 @@
       var name = getComponentName(tableEl);
       if (!name) return;
 
-      // Try API config first, then localStorage fallback
-      var config = viewerConfigs[name] || loadConfigLocal(name);
+      // Try matching by component_id first (multi-page safe), then by name
+      var cid = getComponentId(tableEl);
+      if (cid) _componentIdMap[name] = cid;
+      var config = null;
+      if (cid && viewerConfigs[name + '__' + cid.substring(0, 8)]) {
+        config = viewerConfigs[name + '__' + cid.substring(0, 8)];
+      }
+      if (!config) config = viewerConfigs[name] || loadConfigLocal(name);
       if (!config || !config.enabled) {
         // Only mark as processed if configs are already loaded (avoid premature skip)
         if (viewerConfigsLoaded) processedSet.add(tableEl);

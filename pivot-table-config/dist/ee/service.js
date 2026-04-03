@@ -83,10 +83,87 @@ let PivotTableConfigService = class PivotTableConfigService {
         }
     }
 
+    // ===================== TABLE PROPERTY OVERRIDES =====================
+
+    // When pivot is enabled, set Table component properties to hide UI elements
+    // When disabled, restore original values
+    static PIVOT_OVERRIDES = {
+      displaySearchBox: '{{false}}',
+      enabledSort: '{{false}}',
+      showFilterButton: '{{false}}',
+      enablePagination: '{{false}}',
+      allowSelection: '{{false}}',
+      showAddNewRowButton: '{{false}}',
+      showDownloadButton: '{{false}}',
+      showBulkUpdateActions: '{{false}}',
+      highlightSelectedRow: '{{false}}',
+      showBulkSelector: '{{false}}',
+    };
+
+    async _applyTableOverrides(manager, componentId, pivotEnabled, previousConfig) {
+        if (!componentId) return;
+        try {
+            if (pivotEnabled) {
+                // Save original values before overriding
+                var origRow = await manager.query(
+                    `SELECT properties FROM components WHERE id = $1`, [componentId]
+                );
+                if (origRow.length === 0) return;
+                var props = origRow[0].properties;
+                if (typeof props === 'string') props = JSON.parse(props);
+
+                // Build backup of original values
+                var backup = {};
+                var overrideJson = {};
+                var keys = Object.keys(PivotTableConfigService.PIVOT_OVERRIDES);
+                for (var i = 0; i < keys.length; i++) {
+                    var k = keys[i];
+                    if (props[k]) backup[k] = props[k].value;
+                    overrideJson[k] = { value: PivotTableConfigService.PIVOT_OVERRIDES[k] };
+                }
+
+                // Apply overrides via jsonb merge
+                await manager.query(
+                    `UPDATE components SET properties = (properties::jsonb || $1::jsonb)::json WHERE id = $2`,
+                    [JSON.stringify(overrideJson), componentId]
+                );
+                console.log('[PivotTable] Applied table overrides for', componentId);
+                return backup;
+            } else if (previousConfig && previousConfig._originalTableProps) {
+                // Restore original values
+                var restoreJson = {};
+                var origProps = previousConfig._originalTableProps;
+                var rKeys = Object.keys(origProps);
+                for (var ri = 0; ri < rKeys.length; ri++) {
+                    restoreJson[rKeys[ri]] = { value: origProps[rKeys[ri]] };
+                }
+                if (rKeys.length > 0) {
+                    await manager.query(
+                        `UPDATE components SET properties = (properties::jsonb || $1::jsonb)::json WHERE id = $2`,
+                        [JSON.stringify(restoreJson), componentId]
+                    );
+                    console.log('[PivotTable] Restored table properties for', componentId);
+                }
+            }
+        } catch (e) { console.warn('[PivotTable] table override failed:', e.message); }
+    }
+
     // ===================== CONFIG CRUD =====================
 
     // Resolve component name → component UUID (from components table)
-    async _resolveComponentId(manager, appVersionId, componentName) {
+    // If clientComponentId is provided, verify it exists and use it directly (multi-page safe)
+    async _resolveComponentId(manager, appVersionId, componentName, clientComponentId) {
+        if (clientComponentId) {
+            var check = await manager.query(
+                `SELECT c.id FROM components c
+                 JOIN pages p ON c.page_id = p.id
+                 WHERE c.id = $1 AND p.app_version_id = $2
+                 LIMIT 1`,
+                [clientComponentId, appVersionId]
+            );
+            if (check.length > 0) return check[0].id;
+        }
+        // Fallback: resolve by name (may be ambiguous if same name on multiple pages)
         var rows = await manager.query(
             `SELECT c.id FROM components c
              JOIN pages p ON c.page_id = p.id
@@ -97,33 +174,32 @@ let PivotTableConfigService = class PivotTableConfigService {
         return rows.length > 0 ? rows[0].id : null;
     }
 
-    async getConfig(user, appVersionId, componentName) {
+    async getConfig(user, appVersionId, componentName, clientComponentId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             await this._verifyAccess(manager, user, appVersionId);
-            var compId = await this._resolveComponentId(manager, appVersionId, componentName);
+            var compId = await this._resolveComponentId(manager, appVersionId, componentName, clientComponentId);
 
-            // Try by component_id first
             var rows = [];
             if (compId) {
+                // Exact match by component_id (safe — identifies the right component)
                 rows = await manager.query(
                     `SELECT id, config FROM pivot_table_configs WHERE app_version_id = $1 AND component_id = $2`,
                     [appVersionId, compId]
                 );
             }
-            // Fallback: by component_name (backward compat or pre-migration)
-            if (rows.length === 0) {
+            if (rows.length === 0 && !compId) {
+                // Fallback by name ONLY when component can't be resolved (pre-migration data)
                 rows = await manager.query(
-                    `SELECT id, config FROM pivot_table_configs WHERE app_version_id = $1 AND component_name = $2`,
+                    `SELECT id, config FROM pivot_table_configs WHERE app_version_id = $1 AND component_name = $2 AND component_id IS NULL`,
                     [appVersionId, componentName]
                 );
-            }
-            // Auto-migrate: if found a row without component_id, set it now
-            if (rows.length > 0 && compId) {
-                await manager.query(
-                    `UPDATE pivot_table_configs SET component_id = $1, component_name = $2, updated_at = NOW()
-                     WHERE id = $3 AND (component_id IS NULL OR component_id != $1)`,
-                    [compId, componentName, rows[0].id]
-                ).catch(function (e) { console.warn('[PivotTable] auto-migrate component_id failed:', e.message); });
+                // Auto-migrate: attach component_id to legacy row
+                if (rows.length > 0 && compId) {
+                    await manager.query(
+                        `UPDATE pivot_table_configs SET component_id = $1, updated_at = NOW() WHERE id = $2`,
+                        [compId, rows[0].id]
+                    ).catch(function (e) { console.warn('[PivotTable] auto-migrate failed:', e.message); });
+                }
             }
             return { config: rows.length > 0 ? rows[0].config : null };
         });
@@ -132,7 +208,6 @@ let PivotTableConfigService = class PivotTableConfigService {
     async getAllConfigs(user, appVersionId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             await this._verifyAccess(manager, user, appVersionId);
-            // Join with components to return current name (even if renamed)
             var rows = await manager.query(
                 `SELECT ptc.component_name, ptc.component_id, ptc.config,
                         COALESCE(c.name, ptc.component_name) AS current_name
@@ -141,8 +216,12 @@ let PivotTableConfigService = class PivotTableConfigService {
                  WHERE ptc.app_version_id = $1`,
                 [appVersionId]
             );
+            // Key by component_id (unique) with name for display, fallback to name-only for legacy rows
             var configs = {};
-            for (var r of rows) configs[r.current_name] = r.config;
+            for (var r of rows) {
+                var key = r.component_id || r.current_name;
+                configs[key] = { config: r.config, name: r.current_name, component_id: r.component_id };
+            }
             return { configs };
         });
     }
@@ -150,7 +229,15 @@ let PivotTableConfigService = class PivotTableConfigService {
     async upsertConfig(user, dto) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             await this._verifyAccess(manager, user, dto.app_version_id);
-            var compId = await this._resolveComponentId(manager, dto.app_version_id, dto.component_name);
+            var compId = await this._resolveComponentId(manager, dto.app_version_id, dto.component_name, dto.component_id);
+
+            // Apply/remove table property overrides when pivot enabled/disabled
+            var pivotEnabled = dto.config && dto.config.enabled;
+            var backup = await this._applyTableOverrides(manager, compId, pivotEnabled, dto.config);
+            // Store original props backup in config so we can restore later
+            if (backup && pivotEnabled) {
+                dto.config._originalTableProps = backup;
+            }
             var configJson = JSON.stringify(dto.config);
 
             if (compId) {
@@ -212,13 +299,13 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== DATASOURCE DETECTION =====================
 
-    async detectDataSource(user, appVersionId, componentName) {
+    async detectDataSource(user, appVersionId, componentName, clientComponentId) {
         // Verify authorization
         await (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             await this._verifyAccess(manager, user, appVersionId);
         });
 
-        var queryInfo = await this._resolveComponentQuery(appVersionId, componentName);
+        var queryInfo = await this._resolveComponentQuery(appVersionId, componentName, clientComponentId);
         if (!queryInfo) {
             return { supported: false, kind: null, query_name: null, reason: 'No data query bound to this component' };
         }
@@ -234,7 +321,7 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== BACKEND PIVOT EXECUTION =====================
 
-    async executePivot(user, appVersionId, componentName, pivotConfig, page, pageSize) {
+    async executePivot(user, appVersionId, componentName, pivotConfig, page, pageSize, clientComponentId) {
         // 0. Verify authorization
         await (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             await this._verifyAccess(manager, user, appVersionId);
@@ -268,7 +355,7 @@ let PivotTableConfigService = class PivotTableConfigService {
         }
 
         // 1. Resolve the data query bound to this component
-        var queryInfo = await this._resolveComponentQuery(appVersionId, componentName);
+        var queryInfo = await this._resolveComponentQuery(appVersionId, componentName, clientComponentId);
         if (!queryInfo) {
             throw new common_1.HttpException('No data query found for "' + componentName + '"', common_1.HttpStatus.NOT_FOUND);
         }
@@ -326,17 +413,31 @@ let PivotTableConfigService = class PivotTableConfigService {
 
     // ===================== INTERNAL: RESOLVE COMPONENT → QUERY =====================
 
-    async _resolveComponentQuery(appVersionId, componentName) {
+    async _resolveComponentQuery(appVersionId, componentName, clientComponentId) {
         return (0, database_helper_1.dbTransactionWrap)(async (manager) => {
             // components table has: name, type, properties (JSON with data binding)
             // joined via: components.page_id → pages.id, pages.app_version_id = $1
-            var compRows = await manager.query(
-                `SELECT c.name, c.type, c.properties
-                 FROM components c
-                 JOIN pages p ON c.page_id = p.id
-                 WHERE p.app_version_id = $1 AND c.name = $2`,
-                [appVersionId, componentName]
-            );
+            var compRows;
+            if (clientComponentId) {
+                // Exact match by component UUID (multi-page safe)
+                compRows = await manager.query(
+                    `SELECT c.name, c.type, c.properties
+                     FROM components c
+                     JOIN pages p ON c.page_id = p.id
+                     WHERE c.id = $1 AND p.app_version_id = $2`,
+                    [clientComponentId, appVersionId]
+                );
+            }
+            if (!compRows || compRows.length === 0) {
+                // Fallback: by name (may match multiple across pages)
+                compRows = await manager.query(
+                    `SELECT c.name, c.type, c.properties
+                     FROM components c
+                     JOIN pages p ON c.page_id = p.id
+                     WHERE p.app_version_id = $1 AND c.name = $2`,
+                    [appVersionId, componentName]
+                );
+            }
 
             if (compRows.length === 0) return null;
 

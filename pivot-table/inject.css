@@ -675,3 +675,5 @@
     overflow: visible !important;
   }
 }
+
+/* Pivot table overrides are injected dynamically via <style> tags in inject.js */

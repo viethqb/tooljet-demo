@@ -29,6 +29,11 @@ __decorate([
     (0, class_validator_1.IsObject)(),
     __metadata("design:type", Object)
 ], UpsertPivotConfigDto.prototype, "config", void 0);
+__decorate([
+    (0, class_validator_1.IsOptional)(),
+    (0, class_validator_1.IsUUID)(),
+    __metadata("design:type", String)
+], UpsertPivotConfigDto.prototype, "component_id", void 0);
 
 class DetectDataSourceDto {
 }
@@ -42,6 +47,11 @@ __decorate([
     (0, class_validator_1.IsNotEmpty)(),
     __metadata("design:type", String)
 ], DetectDataSourceDto.prototype, "component_name", void 0);
+__decorate([
+    (0, class_validator_1.IsOptional)(),
+    (0, class_validator_1.IsUUID)(),
+    __metadata("design:type", String)
+], DetectDataSourceDto.prototype, "component_id", void 0);
 
 class PivotConfigDto {
 }
@@ -99,3 +109,8 @@ __decorate([
     (0, class_validator_1.Max)(2000),
     __metadata("design:type", Number)
 ], ExecutePivotDto.prototype, "page_size", void 0);
+__decorate([
+    (0, class_validator_1.IsOptional)(),
+    (0, class_validator_1.IsUUID)(),
+    __metadata("design:type", String)
+], ExecutePivotDto.prototype, "component_id", void 0);
