@@ -409,6 +409,14 @@
   white-space: nowrap;
 }
 
+.pivot-measure-header {
+  background: var(--slate2, #fafbfc) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  color: var(--slate11, #687076) !important;
+  padding: 4px 8px !important;
+}
+
 .pivot-row-header {
   min-width: 100px;
 }
@@ -454,6 +462,8 @@
   background: var(--cc-surface2-surface, #f1f3f5);
   border-top: 2px solid var(--cc-default-border, #d9dbdd);
 }
+
+.dark-theme .pivot-measure-header { background: var(--slate3, #1a1d21) !important; }
 
 /* =====================================================================
    PIVOT TITLE BAR (shared between editor preview and viewer)
@@ -658,6 +668,100 @@
 .pivot-overlay::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* =====================================================================
+   MEASURES LIST (Inspector)
+   ===================================================================== */
+
+.pivot-measures-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.pivot-measure-row {
+  border: 1px solid var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  background: var(--white, #fff);
+  overflow: hidden;
+}
+
+.pivot-measure-summary {
+  display: flex;
+  align-items: center;
+  padding: 6px 8px;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pivot-measure-summary:hover {
+  background: var(--slate2, #fafbfc);
+}
+
+.pivot-measure-drag {
+  cursor: grab;
+  color: var(--slate9, #889096);
+  font-size: 11px;
+  user-select: none;
+}
+
+.pivot-measure-label {
+  flex: 1;
+  color: var(--slate12, #11181c);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pivot-measure-toggle,
+.pivot-measure-remove {
+  cursor: pointer;
+  color: var(--slate9, #889096);
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.pivot-measure-toggle:hover,
+.pivot-measure-remove:hover {
+  color: var(--indigo9, #3e63dd);
+}
+
+.pivot-measure-remove:hover {
+  color: #e5484d;
+}
+
+.pivot-measure-detail {
+  padding: 6px 8px;
+  border-top: 1px solid var(--slate6, #eceef0);
+  background: var(--slate1, #fbfcfd);
+}
+
+.pivot-add-measure-btn {
+  width: 100%;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px dashed var(--slate7, #d9dbdd);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--indigo9, #3e63dd);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.pivot-add-measure-btn:hover {
+  background: var(--indigo3, #edf2fe);
+  border-color: var(--indigo9, #3e63dd);
+  border-style: solid;
+}
+
+.dark-theme .pivot-measure-row { background: var(--slate3, #1a1d21); border-color: var(--slate7, #333); }
+.dark-theme .pivot-measure-detail { background: var(--slate2, #161a1d); border-top-color: var(--slate6, #2a2e33); }
+
 
 /* =====================================================================
    PRINT

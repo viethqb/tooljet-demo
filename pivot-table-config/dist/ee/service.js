@@ -14,7 +14,229 @@ const crypto = require("crypto");
 const AGG_SQL = { count: 'COUNT(*)', sum: 'SUM', avg: 'AVG', min: 'MIN', max: 'MAX' };
 const SQL_KINDS = ['mysql', 'mariadb', 'postgresql', 'mssql', 'oracle', 'starrocks', 'clickhouse', 'bigquery', 'snowflake', 'redshift'];
 const MAX_PAGE_SIZE = 2000;
-const VALID_AGGREGATORS = Object.keys(AGG_SQL);
+const VALID_AGGREGATORS = [
+    'count', 'sum', 'avg', 'min', 'max',
+    'distinct', 'median', 'percentile', 'stddev', 'variance',
+    'sum-where', 'count-where', 'cum-sum', 'cum-count', 'share', 'expr',
+];
+// Aggregators the backend cannot compute in MySQL/MariaDB — force frontend fallback
+// Note: ToolJet registers StarRocks via the MySQL plugin (kind='mysql'). StarRocks supports
+// percentile_approx(), so we emit that and let real-MySQL users see a clear SQL error.
+const MYSQL_UNSUPPORTED = {};
+// Aggregators that produce partials the frontend CAN'T re-aggregate for totals
+const NON_REAGGREGABLE = { median: 1, percentile: 1, stddev: 1, variance: 1, distinct: 1, share: 1, 'cum-sum': 1, 'cum-count': 1, expr: 1 };
+
+// Build per-measure SQL aggregate fragment. Returns `<expr> AS <alias>`.
+// measure: { field, aggregator, percentile?, where?, expression? }
+// ctx: { esc, kind, colFields, rowFields, isWindow (for cumulative), cleanSql, alias }
+function buildAggSql(measure, alias, ctx) {
+    var esc = ctx.esc;
+    var kind = ctx.kind;
+    var agg = measure.aggregator || 'count';
+    var field = measure.field;
+    var escField = field ? esc(field) : null;
+
+    // Safely emit a scalar value for sum-where / count-where WHERE fragment
+    function emitWhere(where) {
+        if (!where || !where.field) return '1=1';
+        var col = esc(where.field);
+        var op = where.op || '=';
+        var val = where.value;
+        // Validate op
+        var allowed = { '=': 1, '!=': 1, '>': 1, '<': 1, '>=': 1, '<=': 1, 'like': 1, 'is null': 1, 'is not null': 1 };
+        if (!allowed[op]) op = '=';
+        if (op === 'is null') return col + ' IS NULL';
+        if (op === 'is not null') return col + ' IS NOT NULL';
+        // Quote value as string literal (safe: replace single quotes)
+        var vStr = "'" + String(val == null ? '' : val).replace(/'/g, "''") + "'";
+        // Numeric comparison: if looks numeric, also try as number (DB coerces)
+        if (op === 'like') return col + ' LIKE ' + vStr;
+        return col + ' ' + op + ' ' + vStr;
+    }
+
+    function countDistinct() {
+        if (kind === 'clickhouse') return 'uniqExact(' + escField + ')';
+        return 'COUNT(DISTINCT ' + escField + ')';
+    }
+    function medianSql() {
+        if (kind === 'clickhouse') return 'quantileExact(0.5)(' + escField + ')';
+        if (kind === 'bigquery') return 'APPROX_QUANTILES(' + escField + ', 100)[OFFSET(50)]';
+        if (kind === 'snowflake') return 'MEDIAN(' + escField + ')';
+        // StarRocks uses MySQL plugin (kind='mysql') and supports percentile_approx natively
+        if (kind === 'starrocks' || kind === 'mysql' || kind === 'mariadb') return 'percentile_approx(' + escField + ', 0.5)';
+        // postgresql / mssql / oracle / redshift
+        return 'PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ' + escField + ')';
+    }
+    function percentileSql() {
+        var p = parseFloat(measure.percentile);
+        if (isNaN(p) || p < 0 || p > 1) p = 0.95;
+        p = Math.round(p * 10000) / 10000;
+        if (kind === 'clickhouse') return 'quantile(' + p + ')(' + escField + ')';
+        if (kind === 'bigquery') {
+            var offset = Math.round(p * 100);
+            return 'APPROX_QUANTILES(' + escField + ', 100)[OFFSET(' + offset + ')]';
+        }
+        if (kind === 'starrocks' || kind === 'mysql' || kind === 'mariadb') return 'percentile_approx(' + escField + ', ' + p + ')';
+        return 'PERCENTILE_CONT(' + p + ') WITHIN GROUP (ORDER BY ' + escField + ')';
+    }
+    function stddevSql() {
+        if (kind === 'mssql') return 'STDEV(' + escField + ')';
+        if (kind === 'clickhouse') return 'stddevSamp(' + escField + ')';
+        return 'STDDEV_SAMP(' + escField + ')';
+    }
+    function varianceSql() {
+        if (kind === 'mssql') return 'VAR(' + escField + ')';
+        if (kind === 'oracle') return 'VARIANCE(' + escField + ')';
+        if (kind === 'clickhouse') return 'varSamp(' + escField + ')';
+        return 'VAR_SAMP(' + escField + ')';
+    }
+    function exprSql() {
+        // Always re-parse server-side; do not trust client-provided AST.
+        if (!measure.expression) return '0';
+        try {
+            var ast = parseExpressionSrv(measure.expression);
+            return compileAstToSql(ast, esc);
+        } catch (e) {
+            throw new common_1.HttpException('Invalid expression: ' + e.message, common_1.HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    var expr;
+    switch (agg) {
+        case 'count': expr = 'COUNT(*)'; break;
+        case 'sum': expr = 'SUM(' + escField + ')'; break;
+        case 'avg': expr = 'AVG(' + escField + ')'; break;
+        case 'min': expr = 'MIN(' + escField + ')'; break;
+        case 'max': expr = 'MAX(' + escField + ')'; break;
+        case 'distinct': expr = countDistinct(); break;
+        case 'median': expr = medianSql(); break;
+        case 'percentile': expr = percentileSql(); break;
+        case 'stddev': expr = stddevSql(); break;
+        case 'variance': expr = varianceSql(); break;
+        case 'sum-where': expr = 'SUM(CASE WHEN ' + emitWhere(measure.where) + ' THEN ' + (escField || '0') + ' ELSE 0 END)'; break;
+        case 'count-where': expr = 'SUM(CASE WHEN ' + emitWhere(measure.where) + ' THEN 1 ELSE 0 END)'; break;
+        case 'share': expr = 'SUM(' + (escField || '1') + ')'; break; // denominator handled via separate query
+        case 'cum-sum': expr = 'SUM(' + (escField || '1') + ')'; break; // window applied by caller
+        case 'cum-count': expr = 'COUNT(*)'; break;
+        case 'expr': expr = exprSql(); break;
+        default: expr = 'COUNT(*)';
+    }
+    return expr + ' AS ' + esc(alias);
+}
+
+// Server-side expression parser (mirror of frontend, so we never trust client AST).
+// Grammar: Expr := Term (('+'|'-') Term)*; Term := Factor (('*'|'/') Factor)*;
+// Factor := Number | AggCall | '(' Expr ')' | '-' Factor; AggCall := FN '(' Ident ')'
+var AGG_CALL_NAMES_SRV = { SUM: 1, AVG: 1, COUNT: 1, MIN: 1, MAX: 1, COUNT_DISTINCT: 1 };
+function parseExpressionSrv(src) {
+    src = String(src || '');
+    var toks = [], i = 0, n = src.length;
+    while (i < n) {
+        var c = src[i];
+        if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+        if (c === '+' || c === '-' || c === '*' || c === '/' || c === '(' || c === ')') { toks.push({ t: c }); i++; continue; }
+        if ((c >= '0' && c <= '9') || c === '.') {
+            var j = i;
+            while (j < n && ((src[j] >= '0' && src[j] <= '9') || src[j] === '.')) j++;
+            toks.push({ t: 'num', v: parseFloat(src.slice(i, j)) });
+            i = j; continue;
+        }
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '_') {
+            var k = i;
+            while (k < n && ((src[k] >= 'A' && src[k] <= 'Z') || (src[k] >= 'a' && src[k] <= 'z') || (src[k] >= '0' && src[k] <= '9') || src[k] === '_' || src[k] === ' ' || src[k] === '.')) k++;
+            toks.push({ t: 'ident', v: src.slice(i, k).trim() });
+            i = k; continue;
+        }
+        throw new Error('Unexpected character in expression: ' + c);
+    }
+    var p = 0;
+    function peek() { return toks[p]; }
+    function eat(t) { var tok = toks[p]; if (!tok || tok.t !== t) throw new Error('Expected ' + t); p++; return tok; }
+    function E() { var l = T(); while (peek() && (peek().t === '+' || peek().t === '-')) { var op = toks[p++].t; l = { type: 'bin', op: op, l: l, r: T() }; } return l; }
+    function T() { var l = F(); while (peek() && (peek().t === '*' || peek().t === '/')) { var op = toks[p++].t; l = { type: 'bin', op: op, l: l, r: F() }; } return l; }
+    function F() {
+        var tok = peek();
+        if (!tok) throw new Error('Unexpected end of expression');
+        if (tok.t === 'num') { p++; return { type: 'num', v: tok.v }; }
+        if (tok.t === '-') { p++; return { type: 'neg', e: F() }; }
+        if (tok.t === '(') { p++; var e = E(); eat(')'); return e; }
+        if (tok.t === 'ident') {
+            p++;
+            var name = tok.v.trim();
+            if (peek() && peek().t === '(') {
+                var up = name.toUpperCase();
+                if (!AGG_CALL_NAMES_SRV[up]) throw new Error('Unknown aggregate: ' + name);
+                p++;
+                var col = eat('ident').v.trim();
+                eat(')');
+                return { type: 'agg', fn: up, col: col };
+            }
+            throw new Error('Bare identifier: ' + name);
+        }
+        throw new Error('Unexpected token');
+    }
+    var ast = E();
+    if (p < toks.length) throw new Error('Trailing tokens in expression');
+    return ast;
+}
+
+// Compile parsed AST (from frontend parser) to SQL.
+// Expects AST with the same shape as frontend parseExpr output.
+function compileAstToSql(ast, esc) {
+    function walk(n) {
+        if (!n) return '0';
+        switch (n.type) {
+            case 'num': return String(n.v);
+            case 'neg': return '(-' + walk(n.e) + ')';
+            case 'bin': return '(' + walk(n.l) + ' ' + n.op + ' ' + walk(n.r) + ')';
+            case 'agg':
+                var col = esc(n.col);
+                if (n.fn === 'SUM') return 'SUM(' + col + ')';
+                if (n.fn === 'AVG') return 'AVG(' + col + ')';
+                if (n.fn === 'COUNT') return 'COUNT(*)';
+                if (n.fn === 'COUNT_DISTINCT') return 'COUNT(DISTINCT ' + col + ')';
+                if (n.fn === 'MIN') return 'MIN(' + col + ')';
+                if (n.fn === 'MAX') return 'MAX(' + col + ')';
+                return '0';
+        }
+        return '0';
+    }
+    return walk(ast);
+}
+
+// Expose normalize helper on server side too
+function normalizeServerConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return cfg;
+    if (!Array.isArray(cfg.measures) || cfg.measures.length === 0) {
+        cfg.measures = [{
+            id: 'm0',
+            field: cfg.valueField || '',
+            aggregator: cfg.aggregator || 'count',
+        }];
+    }
+    for (var i = 0; i < cfg.measures.length; i++) {
+        var m = cfg.measures[i];
+        if (!m.aggregator) m.aggregator = 'count';
+        if (m.field === undefined) m.field = '';
+        if (VALID_AGGREGATORS.indexOf(m.aggregator) === -1) m.aggregator = 'count';
+    }
+    cfg.valueField = cfg.measures[0].field;
+    cfg.aggregator = cfg.measures[0].aggregator;
+    return cfg;
+}
+
+// Decide if backend can handle this config; returns { backendOk, reason }.
+// For mysql/mariadb + quantile aggs, we return backendOk=false (force FE fallback).
+function canBackendHandle(measures, kind) {
+    var isMyType = (kind === 'mysql' || kind === 'mariadb');
+    for (var i = 0; i < measures.length; i++) {
+        var m = measures[i];
+        if (isMyType && MYSQL_UNSUPPORTED[m.aggregator]) {
+            return { backendOk: false, reason: 'Aggregator ' + m.aggregator + ' not supported on ' + kind };
+        }
+    }
+    return { backendOk: true, reason: null };
+}
 
 function escId(name, kind) {
     var s = String(name).replace(/[\x00-\x1f\x7f]/g, ''); // strip control chars
@@ -339,15 +561,25 @@ let PivotTableConfigService = class PivotTableConfigService {
             if (page > 100000) page = 100000; // upper bound safety
         }
 
-        // Validate aggregator
-        var agg = (pivotConfig.aggregator || 'count').toLowerCase();
-        if (VALID_AGGREGATORS.indexOf(agg) === -1) agg = 'count';
-        pivotConfig.aggregator = agg;
+        // Normalize (ensures measures[] exists)
+        normalizeServerConfig(pivotConfig);
+
+        // Validate every measure's aggregator
+        for (var vi = 0; vi < pivotConfig.measures.length; vi++) {
+            var vag = (pivotConfig.measures[vi].aggregator || 'count').toLowerCase();
+            if (VALID_AGGREGATORS.indexOf(vag) === -1) vag = 'count';
+            pivotConfig.measures[vi].aggregator = vag;
+        }
+        pivotConfig.aggregator = pivotConfig.measures[0].aggregator;
 
         // Validate fields: must be non-empty strings, no special chars beyond alphanumeric/underscore/space/dot
         var fieldPattern = /^[\w\s.\-\u00C0-\u024F\u1E00-\u1EFF]+$/;
         var allFields = (pivotConfig.rowFields || []).concat(pivotConfig.colFields || []);
-        if (pivotConfig.valueField) allFields.push(pivotConfig.valueField);
+        for (var mf = 0; mf < pivotConfig.measures.length; mf++) {
+            var mMm = pivotConfig.measures[mf];
+            if (mMm.field) allFields.push(mMm.field);
+            if (mMm.where && mMm.where.field) allFields.push(mMm.where.field);
+        }
         for (var fi = 0; fi < allFields.length; fi++) {
             if (typeof allFields[fi] !== 'string' || !fieldPattern.test(allFields[fi])) {
                 throw new common_1.HttpException('Invalid field name: ' + String(allFields[fi]).substring(0, 50), common_1.HttpStatus.BAD_REQUEST);
@@ -370,6 +602,15 @@ let PivotTableConfigService = class PivotTableConfigService {
 
         var dbKind = (queryInfo.kind || '').toLowerCase();
 
+        // MySQL/MariaDB: reject quantile aggs → client falls back to frontend pivot
+        var capability = canBackendHandle(pivotConfig.measures, dbKind);
+        if (!capability.backendOk) {
+            throw new common_1.HttpException(
+                'Backend pivot unavailable: ' + capability.reason + '. Use frontend pivot.',
+                common_1.HttpStatus.BAD_REQUEST
+            );
+        }
+
         // 3. Generate pivot SQL (with optional LIMIT/OFFSET)
         var pivotSql = this._buildPivotSql(originalSql, pivotConfig, page, pageSize, dbKind);
 
@@ -377,26 +618,92 @@ let PivotTableConfigService = class PivotTableConfigService {
         try {
             var rows = await this._executeQuery(sourceOptions, pivotSql, queryInfo.kind, queryInfo.data_source_id);
 
-            // 5. If paginated, also get total count + grand totals
+            // 5. Count (when paginated) + grand totals (always — needed for correct non-reaggregable aggregators)
             var total = null;
             var grandTotals = null;
             if (pageSize && pageSize > 0) {
-                // Count query: total number of grouped rows
                 var countSql = this._buildPivotCountSql(originalSql, pivotConfig, dbKind);
                 var countResult = await this._executeQuery(sourceOptions, countSql, queryInfo.kind, queryInfo.data_source_id);
                 total = countResult && countResult[0] ? parseInt(countResult[0]._pivot_total || countResult[0].total || 0, 10) : 0;
-
-                // Grand total query: aggregate across ALL data (for grand total row)
+            }
+            // Grand totals + subtotals — server-side (correct for non-reaggregable aggregators)
+            // (a) Per-column grand total: GROUP BY colFields
+            // (b) Overall grand total: no GROUP BY
+            // (c) Subtotal per row-field level: GROUP BY rowFields[0..n] + colFields  (for multi-level subtotal rows)
+            var subtotals = null;
+            try {
                 var grandTotalSql = this._buildGrandTotalSql(originalSql, pivotConfig, dbKind);
                 if (grandTotalSql) {
-                    try {
-                        var gtResult = await this._executeQuery(sourceOptions, grandTotalSql, queryInfo.kind, queryInfo.data_source_id);
-                        grandTotals = gtResult || [];
-                    } catch (gtErr) { console.warn('[PivotTable] grand total query failed:', gtErr.message); }
+                    var gtResult = await this._executeQuery(sourceOptions, grandTotalSql, queryInfo.kind, queryInfo.data_source_id);
+                    grandTotals = gtResult || [];
                 }
-            }
+                if ((pivotConfig.colFields || []).length > 0) {
+                    var overallConfig = Object.assign({}, pivotConfig, { colFields: [] });
+                    var overallSql = this._buildGrandTotalSql(originalSql, overallConfig, dbKind);
+                    if (overallSql) {
+                        var overallResult = await this._executeQuery(sourceOptions, overallSql, queryInfo.kind, queryInfo.data_source_id);
+                        if (overallResult && overallResult[0]) {
+                            overallResult[0]._pivot_overall = true;
+                            grandTotals = (grandTotals || []).concat(overallResult);
+                        }
+                    }
+                }
+                // Subtotals: one query per level (prefix of rowFields, keeping colFields intact)
+                // Plus: leaf-level per-row total (GROUP BY all rowFields, NO colFields) for Row Total cells on data rows
+                var rowFields = pivotConfig.rowFields || [];
+                var colFields = pivotConfig.colFields || [];
+                if (rowFields.length > 0) {
+                    subtotals = [];
+                    // Subtotal rows: level 0..rowFields.length-2 (all prefixes except full)
+                    for (var lvl = 0; lvl < rowFields.length - 1; lvl++) {
+                        var prefixRow = rowFields.slice(0, lvl + 1);
+                        var subtotalCfg = Object.assign({}, pivotConfig, { rowFields: prefixRow });
+                        var subtotalSql = this._buildSubtotalSql(originalSql, subtotalCfg, dbKind, prefixRow, colFields);
+                        if (subtotalSql) {
+                            var subResult = await this._executeQuery(sourceOptions, subtotalSql, queryInfo.kind, queryInfo.data_source_id);
+                            if (subResult && subResult.length) {
+                                for (var sr = 0; sr < subResult.length; sr++) {
+                                    subResult[sr]._pivot_subtotal_level = lvl;
+                                }
+                                subtotals = subtotals.concat(subResult);
+                            }
+                        }
+                        if (colFields.length > 0) {
+                            var subtotalOverallCfg = Object.assign({}, pivotConfig, { rowFields: prefixRow, colFields: [] });
+                            var subtotalOverallSql = this._buildSubtotalSql(originalSql, subtotalOverallCfg, dbKind, prefixRow, []);
+                            if (subtotalOverallSql) {
+                                var subOverallRes = await this._executeQuery(sourceOptions, subtotalOverallSql, queryInfo.kind, queryInfo.data_source_id);
+                                if (subOverallRes && subOverallRes.length) {
+                                    for (var sor = 0; sor < subOverallRes.length; sor++) {
+                                        subOverallRes[sor]._pivot_subtotal_level = lvl;
+                                        subOverallRes[sor]._pivot_overall = true;
+                                    }
+                                    subtotals = subtotals.concat(subOverallRes);
+                                }
+                            }
+                        }
+                    }
+                    // Leaf-level per-row total: GROUP BY all rowFields, NO colFields
+                    // Used for "Row Total" cell on each DATA row (correct for non-reaggregable aggs)
+                    if (colFields.length > 0) {
+                        var leafLevel = rowFields.length - 1;
+                        var leafOverallCfg = Object.assign({}, pivotConfig, { colFields: [] });
+                        var leafOverallSql = this._buildSubtotalSql(originalSql, leafOverallCfg, dbKind, rowFields, []);
+                        if (leafOverallSql) {
+                            var leafRes = await this._executeQuery(sourceOptions, leafOverallSql, queryInfo.kind, queryInfo.data_source_id);
+                            if (leafRes && leafRes.length) {
+                                for (var lr = 0; lr < leafRes.length; lr++) {
+                                    leafRes[lr]._pivot_subtotal_level = leafLevel;
+                                    leafRes[lr]._pivot_overall = true;
+                                }
+                                subtotals = subtotals.concat(leafRes);
+                            }
+                        }
+                    }
+                }
+            } catch (gtErr) { console.warn('[PivotTable] grand total/subtotal query failed:', gtErr.message); }
 
-            return { data: rows, total: total, grand_totals: grandTotals, query_name: queryInfo.name };
+            return { data: rows, total: total, grand_totals: grandTotals, subtotals: subtotals, query_name: queryInfo.name };
         } catch (err) {
             // Log debug info server-side only (never expose SQL to client)
             console.error('[PivotTable] Query failed:', {
@@ -552,10 +859,10 @@ let PivotTableConfigService = class PivotTableConfigService {
     }
 
     _buildPivotSql(originalSql, config, page, pageSize, kind) {
+        normalizeServerConfig(config);
         var rowFields = config.rowFields || [];
         var colFields = config.colFields || [];
-        var valueField = config.valueField || '';
-        var aggregator = config.aggregator || 'count';
+        var measures = config.measures;
 
         var allGroupFields = rowFields.concat(colFields);
         if (allGroupFields.length === 0) {
@@ -565,16 +872,33 @@ let PivotTableConfigService = class PivotTableConfigService {
         var esc = function (f) { return escId(f, kind); };
         var alias = function (a) { return escId(a, kind); };
         var selectParts = allGroupFields.map(esc);
-        var aggFunc = AGG_SQL[aggregator] || 'COUNT(*)';
 
-        if (aggregator === 'count' || !valueField) {
-            selectParts.push('COUNT(*) AS ' + alias('_pivot_value'));
-        } else {
-            selectParts.push(aggFunc + '(' + esc(valueField) + ') AS ' + alias('_pivot_value'));
+        // Emit one aggregated column per measure (multi-measure support)
+        for (var mi = 0; mi < measures.length; mi++) {
+            var m = measures[mi];
+            var aliasName = '_pivot_m_' + mi;
+            selectParts.push(buildAggSql(m, aliasName, { esc: esc, kind: kind, colFields: colFields, rowFields: rowFields }));
+            // Weighted avg companion count
+            if (m.aggregator === 'avg' && m.field) {
+                selectParts.push('COUNT(' + esc(m.field) + ') AS ' + alias('_pivot_mc_' + mi));
+            } else {
+                selectParts.push('COUNT(*) AS ' + alias('_pivot_mc_' + mi));
+            }
         }
-        // For weighted avg: use COUNT(valueField) to exclude NULLs, else COUNT(*)
-        if (aggregator === 'avg' && valueField) {
-            selectParts.push('COUNT(' + esc(valueField) + ') AS ' + alias('_pivot_count'));
+        // Legacy alias for backward-compat: first measure mirrored to _pivot_value / _pivot_count
+        var m0 = measures[0];
+        var firstExpr;
+        switch (m0.aggregator) {
+            case 'count': firstExpr = 'COUNT(*)'; break;
+            case 'sum': firstExpr = 'SUM(' + esc(m0.field) + ')'; break;
+            case 'avg': firstExpr = 'AVG(' + esc(m0.field) + ')'; break;
+            case 'min': firstExpr = 'MIN(' + esc(m0.field) + ')'; break;
+            case 'max': firstExpr = 'MAX(' + esc(m0.field) + ')'; break;
+            default: firstExpr = 'COUNT(*)';
+        }
+        selectParts.push(firstExpr + ' AS ' + alias('_pivot_value'));
+        if (m0.aggregator === 'avg' && m0.field) {
+            selectParts.push('COUNT(' + esc(m0.field) + ') AS ' + alias('_pivot_count'));
         } else {
             selectParts.push('COUNT(*) AS ' + alias('_pivot_count'));
         }
@@ -587,6 +911,28 @@ let PivotTableConfigService = class PivotTableConfigService {
         var baseSql = 'SELECT ' + selectParts.join(', ') + '\n' +
             'FROM (\n' + cleanSql + '\n) AS ' + alias('_pivot_src') + '\n' +
             'GROUP BY ' + groupBy.join(', ');
+
+        // Check if any measure is cumulative — wrap in window function
+        var hasCumulative = measures.some(function (m) { return m.aggregator === 'cum-sum' || m.aggregator === 'cum-count'; });
+        if (hasCumulative) {
+            // Build outer SELECT with windows over the base query
+            var outerParts = allGroupFields.map(esc);
+            for (var ci = 0; ci < measures.length; ci++) {
+                var mc = measures[ci];
+                var baseAlias = alias('_pivot_m_' + ci);
+                if (mc.aggregator === 'cum-sum' || mc.aggregator === 'cum-count') {
+                    var partition = colFields.length ? ('PARTITION BY ' + colFields.map(esc).join(', ') + ' ') : '';
+                    var orderBy = 'ORDER BY ' + rowGroupBy.join(', ');
+                    outerParts.push('SUM(' + baseAlias + ') OVER (' + partition + orderBy + ' ROWS UNBOUNDED PRECEDING) AS ' + baseAlias);
+                } else {
+                    outerParts.push(baseAlias);
+                }
+                outerParts.push(alias('_pivot_mc_' + ci));
+            }
+            outerParts.push(alias('_pivot_value'));
+            outerParts.push(alias('_pivot_count'));
+            baseSql = 'SELECT ' + outerParts.join(', ') + ' FROM (\n' + baseSql + '\n) AS ' + alias('_pivot_cum');
+        }
 
         // Pagination: use DENSE_RANK on rowFields to keep all cells of one row key on same page
         if (pageSize && pageSize > 0 && rowFields.length > 0 && colFields.length > 0) {
@@ -604,7 +950,6 @@ let PivotTableConfigService = class PivotTableConfigService {
                 ' AND ' + alias('_pivot_row_rank') + ' <= ' + parseInt(offset + pageSize, 10) + '\n' +
                 'ORDER BY ' + groupBy.join(', ');
         } else if (pageSize && pageSize > 0) {
-            // No colFields: each grouped row = one visual row, simple LIMIT/OFFSET
             var offset = (page || 0) * pageSize;
             return baseSql + '\nORDER BY ' + groupBy.join(', ') +
                 '\nLIMIT ' + parseInt(pageSize, 10) + ' OFFSET ' + parseInt(offset, 10);
@@ -628,38 +973,98 @@ let PivotTableConfigService = class PivotTableConfigService {
             ') AS ' + esc('_pivot_cnt');
     }
 
-    _buildGrandTotalSql(originalSql, config, kind) {
-        var colFields = config.colFields || [];
-        var valueField = config.valueField || '';
-        var aggregator = config.aggregator || 'count';
+    // Subtotal SQL: GROUP BY prefixRowFields + colFields. Emits same measure columns as main pivot.
+    _buildSubtotalSql(originalSql, config, kind, prefixRowFields, colFields) {
+        normalizeServerConfig(config);
+        var measures = config.measures;
         var cleanSql = originalSql.replace(/;\s*$/, '');
-        var aggFunc = AGG_SQL[aggregator] || 'COUNT(*)';
         var esc = function (f) { return escId(f, kind); };
+        var m0 = measures[0];
+
+        var allGroup = (prefixRowFields || []).concat(colFields || []);
+        var selectParts = allGroup.map(esc);
+        for (var mi = 0; mi < measures.length; mi++) {
+            var m = measures[mi];
+            selectParts.push(buildAggSql(m, '_pivot_m_' + mi, { esc: esc, kind: kind, colFields: colFields, rowFields: prefixRowFields }));
+            if (m.aggregator === 'avg' && m.field) {
+                selectParts.push('COUNT(' + esc(m.field) + ') AS ' + esc('_pivot_mc_' + mi));
+            } else {
+                selectParts.push('COUNT(*) AS ' + esc('_pivot_mc_' + mi));
+            }
+        }
+        var firstExpr;
+        switch (m0.aggregator) {
+            case 'count': firstExpr = 'COUNT(*)'; break;
+            case 'sum': firstExpr = 'SUM(' + esc(m0.field) + ')'; break;
+            case 'avg': firstExpr = 'AVG(' + esc(m0.field) + ')'; break;
+            case 'min': firstExpr = 'MIN(' + esc(m0.field) + ')'; break;
+            case 'max': firstExpr = 'MAX(' + esc(m0.field) + ')'; break;
+            default: firstExpr = 'COUNT(*)';
+        }
+        selectParts.push(firstExpr + ' AS ' + esc('_pivot_value'));
+        if (m0.aggregator === 'avg' && m0.field) {
+            selectParts.push('COUNT(' + esc(m0.field) + ') AS ' + esc('_pivot_count'));
+        } else {
+            selectParts.push('COUNT(*) AS ' + esc('_pivot_count'));
+        }
+        if (allGroup.length === 0) {
+            return 'SELECT ' + selectParts.join(', ') + '\nFROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src');
+        }
+        var groupBy = allGroup.map(esc);
+        return 'SELECT ' + selectParts.join(', ') + '\n' +
+            'FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src') + '\n' +
+            'GROUP BY ' + groupBy.join(', ') + '\n' +
+            'ORDER BY ' + groupBy.join(', ');
+    }
+
+    _buildGrandTotalSql(originalSql, config, kind) {
+        normalizeServerConfig(config);
+        var colFields = config.colFields || [];
+        var measures = config.measures;
+        var cleanSql = originalSql.replace(/;\s*$/, '');
+        var esc = function (f) { return escId(f, kind); };
+        var m0 = measures[0];
+
+        // Build multi-measure SELECT fragment (for the first measure it also mirrors to _pivot_value for back-compat)
+        function buildMeasureParts() {
+            var parts = [];
+            for (var mi = 0; mi < measures.length; mi++) {
+                var m = measures[mi];
+                parts.push(buildAggSql(m, '_pivot_m_' + mi, { esc: esc, kind: kind, colFields: colFields, rowFields: [] }));
+                if (m.aggregator === 'avg' && m.field) {
+                    parts.push('COUNT(' + esc(m.field) + ') AS ' + esc('_pivot_mc_' + mi));
+                } else {
+                    parts.push('COUNT(*) AS ' + esc('_pivot_mc_' + mi));
+                }
+            }
+            // Legacy mirror
+            var firstExpr;
+            switch (m0.aggregator) {
+                case 'count': firstExpr = 'COUNT(*)'; break;
+                case 'sum': firstExpr = 'SUM(' + esc(m0.field) + ')'; break;
+                case 'avg': firstExpr = 'AVG(' + esc(m0.field) + ')'; break;
+                case 'min': firstExpr = 'MIN(' + esc(m0.field) + ')'; break;
+                case 'max': firstExpr = 'MAX(' + esc(m0.field) + ')'; break;
+                default: firstExpr = 'COUNT(*)';
+            }
+            parts.push(firstExpr + ' AS ' + esc('_pivot_value'));
+            if (m0.aggregator === 'avg' && m0.field) {
+                parts.push('COUNT(' + esc(m0.field) + ') AS ' + esc('_pivot_count'));
+            } else {
+                parts.push('COUNT(*) AS ' + esc('_pivot_count'));
+            }
+            return parts;
+        }
 
         if (colFields.length > 0) {
-            // Grand total per column value + overall total
-            var selectParts = colFields.map(esc);
-            if (aggregator === 'count' || !valueField) {
-                selectParts.push('COUNT(*) AS ' + esc('_pivot_value'));
-            } else {
-                selectParts.push(aggFunc + '(' + esc(valueField) + ') AS ' + esc('_pivot_value'));
-            }
-            // For weighted avg: use COUNT(valueField) to exclude NULLs
-            if (aggregator === 'avg' && valueField) {
-                selectParts.push('COUNT(' + esc(valueField) + ') AS ' + esc('_pivot_count'));
-            } else {
-                selectParts.push('COUNT(*) AS ' + esc('_pivot_count'));
-            }
+            var selectParts = colFields.map(esc).concat(buildMeasureParts());
             var groupBy = colFields.map(esc);
-
             return 'SELECT ' + selectParts.join(', ') + '\n' +
                 'FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src') + '\n' +
                 'GROUP BY ' + groupBy.join(', ') + '\n' +
                 'ORDER BY ' + groupBy.join(', ');
         } else {
-            // No column fields: just overall total
-            var valExpr = (aggregator === 'count' || !valueField) ? 'COUNT(*)' : aggFunc + '(' + esc(valueField) + ')';
-            return 'SELECT ' + valExpr + ' AS ' + esc('_pivot_value') + ' FROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src');
+            return 'SELECT ' + buildMeasureParts().join(', ') + '\nFROM (\n' + cleanSql + '\n) AS ' + esc('_pivot_src');
         }
     }
 

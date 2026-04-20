@@ -75,9 +75,20 @@ __decorate([
 __decorate([
     (0, class_validator_1.IsOptional)(),
     (0, class_validator_1.IsString)(),
-    (0, class_validator_1.IsIn)(['count', 'sum', 'avg', 'min', 'max']),
+    (0, class_validator_1.IsIn)(['count', 'sum', 'avg', 'min', 'max', 'distinct', 'median', 'percentile', 'stddev', 'variance', 'sum-where', 'count-where', 'cum-sum', 'cum-count', 'share', 'expr']),
     __metadata("design:type", String)
 ], PivotConfigDto.prototype, "aggregator", void 0);
+__decorate([
+    (0, class_validator_1.IsOptional)(),
+    (0, class_validator_1.IsArray)(),
+    __metadata("design:type", Array)
+], PivotConfigDto.prototype, "measures", void 0);
+__decorate([
+    (0, class_validator_1.IsOptional)(),
+    (0, class_validator_1.IsArray)(),
+    (0, class_validator_1.IsString)({ each: true }),
+    __metadata("design:type", Array)
+], PivotConfigDto.prototype, "collapsedRowPaths", void 0);
 
 class ExecutePivotDto {
 }

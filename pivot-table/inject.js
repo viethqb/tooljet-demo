@@ -22,9 +22,15 @@
   console.log(LOG_PREFIX, isEditor ? 'Editor' : 'Viewer', 'mode, app:', appSlug);
 
   // ===================== UTILS =====================
+  // Detect ISO date-time strings and shorten to 'YYYY-MM-DD' (pretty-print for row labels)
+  var _isoDateRe = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
   function esc(s) {
+    var str = String(s ?? '');
+    var m = str.match(_isoDateRe);
+    // If midnight UTC and time is 00:00:00.000Z → show as date only
+    if (m && /T00:00:00(\.0+)?Z$/.test(str)) str = m[1];
     var d = document.createElement('div');
-    d.textContent = String(s ?? '');
+    d.textContent = str;
     return d.innerHTML;
   }
 
@@ -90,6 +96,41 @@
   // Cache for intercepted query data (queryId -> data[])
   var _queryDataCache = {};
 
+  // Reshape backend pivot rows into a flat data array consumable by computePivot.
+  // Handles both legacy single-measure (_pivot_value) and multi-measure (_pivot_m_0, _pivot_m_1, ...).
+  function reshapeBackendRows(rows, config) {
+    normalizeConfig(config);
+    var measures = config.measures;
+    var isMulti = measures.length > 1;
+    return rows.map(function (row) {
+      var r = {};
+      for (var k in row) {
+        if (k === '_pivot_value' || k === '_pivot_row_rank' || k === '_pivot_count') continue;
+        if (/^_pivot_m_\d+$/.test(k)) continue;
+        if (/^_pivot_mc_\d+$/.test(k)) continue;
+        r[k] = row[k];
+      }
+      if (isMulti) {
+        for (var mi = 0; mi < measures.length; mi++) {
+          var m = measures[mi];
+          var val = row['_pivot_m_' + mi];
+          if (val === undefined) val = row['_pivot_value'];
+          // Primary storage: synthetic per-measure key (collision-safe)
+          r['__m_' + m.id] = val;
+          // Mirror to field name too (first-come wins; for display in traditional sense)
+          if (m.field && r[m.field] === undefined) r[m.field] = val;
+        }
+        r['_pivot_value'] = row['_pivot_m_0'] !== undefined ? row['_pivot_m_0'] : row['_pivot_value'];
+        if (row['_pivot_mc_0'] !== undefined) r['_pivot_count'] = row['_pivot_mc_0'];
+      } else {
+        var primary = config.valueField || measures[0].field || '_count';
+        r[primary] = row['_pivot_value'];
+        if (row['_pivot_count'] !== undefined) r['_pivot_count'] = row['_pivot_count'];
+      }
+      return r;
+    });
+  }
+
   // Detect app version ID from multiple sources (called when needed)
   function detectAppVersionId() {
     if (_appVersionId) return _appVersionId;
@@ -152,12 +193,12 @@
   function loadConfigLocal(name) {
     try {
       var raw = localStorage.getItem(storageKey(name));
-      if (raw) return JSON.parse(raw);
+      if (raw) return normalizeConfig(JSON.parse(raw));
       // Only fallback to legacy key if we DON'T have a component_id
       // (means component_id hasn't been captured yet — true migration scenario)
       if (!_componentIdMap[name]) {
         var legacyRaw = localStorage.getItem('pivot__' + appSlug + '__' + name);
-        return legacyRaw ? JSON.parse(legacyRaw) : null;
+        return legacyRaw ? normalizeConfig(JSON.parse(legacyRaw)) : null;
       }
       return null;
     } catch (_) { return null; }
@@ -191,8 +232,9 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (data) {
         if (data && data.config) {
-          saveConfigLocal(name, data.config); // sync localStorage
-          callback(data.config);
+          var cfg = normalizeConfig(data.config);
+          saveConfigLocal(name, cfg); // sync localStorage
+          callback(cfg);
         } else {
           // API returned null — maybe migrate from localStorage
           var local = loadConfigLocal(name);
@@ -230,12 +272,12 @@
                   cfgName = cfgName + '__' + entry.component_id.substring(0, 8);
                 }
               }
-              result[cfgName] = entry.config;
-              saveConfigLocal(cfgName, entry.config);
+              result[cfgName] = normalizeConfig(entry.config);
+              saveConfigLocal(cfgName, result[cfgName]);
             } else {
               // Legacy format: config directly
-              result[keys[i]] = entry;
-              saveConfigLocal(keys[i], entry);
+              result[keys[i]] = normalizeConfig(entry);
+              saveConfigLocal(keys[i], result[keys[i]]);
             }
           }
           callback(result);
@@ -272,13 +314,16 @@
         }
         return r.json();
       })
-      .then(function (result) { callback(null, result.data || [], result.total, result.grand_totals); })
-      .catch(function (err) { callback(err, [], null, null); });
+      .then(function (result) { callback(null, result.data || [], result.total, result.grand_totals, result.subtotals); })
+      .catch(function (err) { callback(err, [], null, null, null); });
   }
+
+  function _newMeasureId() { return 'm_' + Math.random().toString(36).slice(2, 10); }
 
   function defaultConfig() {
     return {
       enabled: false, rowFields: [], colFields: [], valueField: '', aggregator: 'count',
+      measures: [{ id: _newMeasureId(), field: '', aggregator: 'count', label: '' }],
       showTitle: true, titleAlias: '',
       showRowTotal: true, rowTotalLabel: 'Total',
       showGrandTotal: true, grandTotalLabel: 'Grand Total',
@@ -294,6 +339,41 @@
     };
   }
 
+  // Normalize a loaded config: ensure `measures` exists, parse expressions, mirror legacy
+  // Idempotent — safe to call multiple times. Returns the same object (mutates in place).
+  function normalizeConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return cfg;
+    // Ensure measures array exists (migrate from legacy valueField + aggregator)
+    if (!Array.isArray(cfg.measures) || cfg.measures.length === 0) {
+      cfg.measures = [{
+        id: _newMeasureId(),
+        field: cfg.valueField || '',
+        aggregator: cfg.aggregator || 'count',
+        label: '',
+      }];
+    }
+    // Ensure each measure has an id
+    for (var i = 0; i < cfg.measures.length; i++) {
+      var m = cfg.measures[i];
+      if (!m.id) m.id = _newMeasureId();
+      if (!m.aggregator) m.aggregator = 'count';
+      if (m.field === undefined) m.field = '';
+      if (!AGG_REGISTRY[m.aggregator]) m.aggregator = 'count';
+      // Parse expression AST for expr measures
+      if (m.aggregator === 'expr' && m.expression) {
+        var parsed = validateExpression(m.expression, null);
+        m._ast = parsed.ast;
+        m._exprError = parsed.error;
+      } else {
+        delete m._ast; delete m._exprError;
+      }
+    }
+    // Mirror first measure to legacy fields for backward-compat with old clients
+    cfg.valueField = cfg.measures[0].field;
+    cfg.aggregator = cfg.measures[0].aggregator;
+    return cfg;
+  }
+
   // ===================== PAGINATION STATE (runtime, not persisted) =====================
   var _pivotPage = {}; // componentName -> current page (0-based)
 
@@ -307,13 +387,271 @@
   }
 
   // ===================== AGGREGATORS =====================
-  const AGG = {
-    count: { label: 'Count', fn: (v) => v.length },
-    sum:   { label: 'Sum',   fn: (v) => v.reduce((a, b) => a + (parseFloat(b) || 0), 0) },
-    avg:   { label: 'Avg',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? (n.reduce((a, b) => a + b, 0) / n.length) : 0; } },
-    min:   { label: 'Min',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? Math.min(...n) : ''; } },
-    max:   { label: 'Max',   fn: (v) => { const n = v.map(Number).filter((x) => !isNaN(x)); return n.length ? Math.max(...n) : ''; } },
+  // Registry: each entry has label, compute(values, rows, measure), sqlKind, reAggregate
+  // reAggregate: 'simple' (sum), 'weighted' (avg with counts), 'none' (can't re-aggregate partials)
+  // Cells store { val, row } tuples; the registry decides whether to use rows or just values.
+  function _toNums(v) { var n = []; for (var i = 0; i < v.length; i++) { var x = parseFloat(v[i]); if (!isNaN(x) && isFinite(x)) n.push(x); } return n; }
+  function _percentile(nums, p) {
+    if (!nums.length) return 0;
+    var s = nums.slice().sort(function (a, b) { return a - b; });
+    var idx = p * (s.length - 1);
+    var lo = Math.floor(idx), hi = Math.ceil(idx), frac = idx - lo;
+    return s[lo] + (s[hi] - s[lo]) * frac;
+  }
+  function _variance(nums) {
+    if (nums.length < 2) return 0;
+    var m = nums.reduce(function (a, b) { return a + b; }, 0) / nums.length;
+    var sq = 0;
+    for (var i = 0; i < nums.length; i++) { var d = nums[i] - m; sq += d * d; }
+    return sq / (nums.length - 1); // sample variance
+  }
+  function _matchWhere(row, where) {
+    if (!where || !where.field) return true;
+    var v = row[where.field];
+    var op = where.op || '=';
+    var val = where.value;
+    switch (op) {
+      case '=': return String(v ?? '') === String(val ?? '');
+      case '!=': return String(v ?? '') !== String(val ?? '');
+      case '>': return parseFloat(v) > parseFloat(val);
+      case '<': return parseFloat(v) < parseFloat(val);
+      case '>=': return parseFloat(v) >= parseFloat(val);
+      case '<=': return parseFloat(v) <= parseFloat(val);
+      case 'is null': return v === null || v === undefined || v === '';
+      case 'is not null': return !(v === null || v === undefined || v === '');
+      case 'like': return String(v ?? '').toLowerCase().indexOf(String(val ?? '').toLowerCase()) !== -1;
+      default: return true;
+    }
+  }
+
+  const AGG_REGISTRY = {
+    count: {
+      label: 'Count', sqlKind: 'simple', reAggregate: 'simple',
+      compute: function (cells) { return cells.length; },
+    },
+    sum: {
+      label: 'Sum', sqlKind: 'simple', reAggregate: 'simple',
+      compute: function (cells) { var s = 0; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) s += x; } return s; },
+    },
+    avg: {
+      label: 'Avg', sqlKind: 'simple', reAggregate: 'weighted',
+      compute: function (cells) { var nums = []; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) nums.push(x); } return nums.length ? nums.reduce(function (a, b) { return a + b; }, 0) / nums.length : 0; },
+    },
+    min: {
+      label: 'Min', sqlKind: 'simple', reAggregate: 'min',
+      compute: function (cells) { var nums = []; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) nums.push(x); } return nums.length ? Math.min.apply(null, nums) : ''; },
+    },
+    max: {
+      label: 'Max', sqlKind: 'simple', reAggregate: 'max',
+      compute: function (cells) { var nums = []; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) nums.push(x); } return nums.length ? Math.max.apply(null, nums) : ''; },
+    },
+    distinct: {
+      label: 'Count Distinct', sqlKind: 'distinct', reAggregate: 'none',
+      compute: function (cells) { var set = new Set(); for (var i = 0; i < cells.length; i++) set.add(cells[i].val); return set.size; },
+    },
+    median: {
+      label: 'Median', sqlKind: 'quantile', reAggregate: 'none',
+      compute: function (cells) { return _percentile(_toNums(cells.map(function (c) { return c.val; })), 0.5); },
+    },
+    percentile: {
+      label: 'Percentile', sqlKind: 'quantile', reAggregate: 'none',
+      compute: function (cells, rows, measure) { var p = parseFloat((measure && measure.percentile) || 0.95); if (isNaN(p) || p < 0 || p > 1) p = 0.95; return _percentile(_toNums(cells.map(function (c) { return c.val; })), p); },
+    },
+    stddev: {
+      label: 'Std Dev', sqlKind: 'variance', reAggregate: 'none',
+      compute: function (cells) { return Math.sqrt(_variance(_toNums(cells.map(function (c) { return c.val; })))); },
+    },
+    variance: {
+      label: 'Variance', sqlKind: 'variance', reAggregate: 'none',
+      compute: function (cells) { return _variance(_toNums(cells.map(function (c) { return c.val; }))); },
+    },
+    'sum-where': {
+      label: 'Sum Where', sqlKind: 'conditional', reAggregate: 'simple',
+      compute: function (cells, rows, measure) {
+        var field = measure && measure.field;
+        var where = measure && measure.where;
+        if (!rows || !rows.length) return 0;
+        var s = 0;
+        for (var i = 0; i < rows.length; i++) {
+          if (_matchWhere(rows[i], where)) {
+            var x = parseFloat(field ? rows[i][field] : 0);
+            if (!isNaN(x)) s += x;
+          }
+        }
+        return s;
+      },
+    },
+    'count-where': {
+      label: 'Count Where', sqlKind: 'conditional', reAggregate: 'simple',
+      compute: function (cells, rows, measure) {
+        var where = measure && measure.where;
+        if (!rows || !rows.length) return 0;
+        var n = 0;
+        for (var i = 0; i < rows.length; i++) if (_matchWhere(rows[i], where)) n++;
+        return n;
+      },
+    },
+    'cum-sum': {
+      label: 'Cumulative Sum', sqlKind: 'window', reAggregate: 'none',
+      compute: function (cells) { var s = 0; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) s += x; } return s; },
+      cumulative: true,
+    },
+    'cum-count': {
+      label: 'Cumulative Count', sqlKind: 'window', reAggregate: 'none',
+      compute: function (cells) { return cells.length; },
+      cumulative: true,
+    },
+    share: {
+      label: 'Share of Total', sqlKind: 'twopass', reAggregate: 'none',
+      compute: function (cells) { var s = 0; for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) s += x; } return s; },
+      twopass: true, // post-process: divide by denominator
+    },
+    expr: {
+      label: 'Custom Expression', sqlKind: 'expr', reAggregate: 'none',
+      compute: function (cells, rows, measure) {
+        try { return evalExpression(measure && measure._ast, rows || []); } catch (_) { return 0; }
+      },
+    },
   };
+
+  // Backward-compat shim: old code uses AGG[key].fn(values) with plain values array
+  const AGG = {
+    count: { label: 'Count', fn: function (v) { return v.length; } },
+    sum: { label: 'Sum', fn: function (v) { var s = 0; for (var i = 0; i < v.length; i++) { var x = parseFloat(v[i]); if (!isNaN(x)) s += x; } return s; } },
+    avg: { label: 'Avg', fn: function (v) { var n = _toNums(v); return n.length ? n.reduce(function (a, b) { return a + b; }, 0) / n.length : 0; } },
+    min: { label: 'Min', fn: function (v) { var n = _toNums(v); return n.length ? Math.min.apply(null, n) : ''; } },
+    max: { label: 'Max', fn: function (v) { var n = _toNums(v); return n.length ? Math.max.apply(null, n) : ''; } },
+  };
+
+  // ===================== EXPRESSION PARSER (custom aggregations) =====================
+  // Grammar:
+  //   Expr    := Term (('+' | '-') Term)*
+  //   Term    := Factor (('*' | '/') Factor)*
+  //   Factor  := Number | AggCall | '(' Expr ')' | '-' Factor
+  //   AggCall := ('SUM'|'AVG'|'COUNT'|'MIN'|'MAX'|'COUNT_DISTINCT') '(' Ident ')'
+  //   Ident   := [A-Za-z_][A-Za-z0-9_ .]*
+  // NO eval/Function. Agg functions whitelist only. Idents validated against allowed columns at eval time.
+  var AGG_CALL_NAMES = { SUM: 1, AVG: 1, COUNT: 1, MIN: 1, MAX: 1, COUNT_DISTINCT: 1 };
+
+  function tokenizeExpr(src) {
+    var toks = [], i = 0, n = src.length;
+    while (i < n) {
+      var c = src[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+      if (c === '+' || c === '-' || c === '*' || c === '/' || c === '(' || c === ')' || c === ',') { toks.push({ t: c }); i++; continue; }
+      if (c >= '0' && c <= '9' || c === '.') {
+        var j = i;
+        while (j < n && (src[j] >= '0' && src[j] <= '9' || src[j] === '.')) j++;
+        toks.push({ t: 'num', v: parseFloat(src.slice(i, j)) });
+        i = j; continue;
+      }
+      if (c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c === '_') {
+        var k = i;
+        while (k < n && (src[k] >= 'A' && src[k] <= 'Z' || src[k] >= 'a' && src[k] <= 'z' || src[k] >= '0' && src[k] <= '9' || src[k] === '_' || src[k] === ' ' || src[k] === '.')) k++;
+        var word = src.slice(i, k).trim();
+        toks.push({ t: 'ident', v: word });
+        i = k; continue;
+      }
+      throw new Error('Unexpected character: ' + c);
+    }
+    return toks;
+  }
+
+  function parseExpr(src) {
+    var toks = tokenizeExpr(src), p = 0;
+    function peek() { return toks[p]; }
+    function eat(t) { var tok = toks[p]; if (!tok || tok.t !== t) throw new Error('Expected ' + t + ', got ' + (tok ? tok.t : 'EOF')); p++; return tok; }
+    function parseE() {
+      var left = parseT();
+      while (peek() && (peek().t === '+' || peek().t === '-')) { var op = toks[p++].t; var right = parseT(); left = { type: 'bin', op: op, l: left, r: right }; }
+      return left;
+    }
+    function parseT() {
+      var left = parseF();
+      while (peek() && (peek().t === '*' || peek().t === '/')) { var op = toks[p++].t; var right = parseF(); left = { type: 'bin', op: op, l: left, r: right }; }
+      return left;
+    }
+    function parseF() {
+      var tok = peek();
+      if (!tok) throw new Error('Unexpected end');
+      if (tok.t === 'num') { p++; return { type: 'num', v: tok.v }; }
+      if (tok.t === '-') { p++; return { type: 'neg', e: parseF() }; }
+      if (tok.t === '(') { p++; var e = parseE(); eat(')'); return e; }
+      if (tok.t === 'ident') {
+        p++;
+        var name = tok.v.trim();
+        if (peek() && peek().t === '(') {
+          // AggCall
+          var upper = name.toUpperCase();
+          if (!AGG_CALL_NAMES[upper]) throw new Error('Unknown aggregate: ' + name);
+          p++; // eat '('
+          var col = eat('ident').v.trim();
+          eat(')');
+          return { type: 'agg', fn: upper, col: col };
+        }
+        throw new Error('Bare identifier not allowed: ' + name);
+      }
+      throw new Error('Unexpected token: ' + tok.t);
+    }
+    var ast = parseE();
+    if (p < toks.length) throw new Error('Unexpected trailing tokens');
+    return ast;
+  }
+
+  function evalExpression(ast, rows) {
+    if (!ast) return 0;
+    function walk(n) {
+      switch (n.type) {
+        case 'num': return n.v;
+        case 'neg': return -walk(n.e);
+        case 'bin':
+          var l = walk(n.l), r = walk(n.r);
+          if (n.op === '+') return l + r;
+          if (n.op === '-') return l - r;
+          if (n.op === '*') return l * r;
+          if (n.op === '/') return r === 0 ? 0 : l / r;
+          return 0;
+        case 'agg':
+          var col = n.col, fn = n.fn, nums = [];
+          if (fn === 'COUNT') return rows.length;
+          if (fn === 'COUNT_DISTINCT') { var set = new Set(); for (var i = 0; i < rows.length; i++) set.add(rows[i][col]); return set.size; }
+          for (var k = 0; k < rows.length; k++) { var x = parseFloat(rows[k][col]); if (!isNaN(x)) nums.push(x); }
+          if (!nums.length) return 0;
+          if (fn === 'SUM') return nums.reduce(function (a, b) { return a + b; }, 0);
+          if (fn === 'AVG') return nums.reduce(function (a, b) { return a + b; }, 0) / nums.length;
+          if (fn === 'MIN') return Math.min.apply(null, nums);
+          if (fn === 'MAX') return Math.max.apply(null, nums);
+          return 0;
+      }
+      return 0;
+    }
+    return walk(ast);
+  }
+
+  // Validate expression: parses + checks columns exist in allowedCols. Returns { ast, error }.
+  function validateExpression(src, allowedCols) {
+    try {
+      var ast = parseExpr(String(src || ''));
+      // Walk to check columns
+      function check(n) {
+        if (!n) return null;
+        if (n.type === 'agg') {
+          if (allowedCols && allowedCols.length && allowedCols.indexOf(n.col) === -1) {
+            return 'Unknown column: ' + n.col;
+          }
+        }
+        if (n.l) { var e1 = check(n.l); if (e1) return e1; }
+        if (n.r) { var e2 = check(n.r); if (e2) return e2; }
+        if (n.e) { var e3 = check(n.e); if (e3) return e3; }
+        return null;
+      }
+      var err = check(ast);
+      if (err) return { ast: null, error: err };
+      return { ast: ast, error: null };
+    } catch (e) {
+      return { ast: null, error: e.message };
+    }
+  }
 
   // ===================== DATA EXTRACTION + CACHE =====================
   // Cache per component name — survives display:none (virtualized table renders 0 rows when hidden)
@@ -474,10 +812,14 @@
   }
 
   // ===================== PIVOT COMPUTATION =====================
+  // tree[rk] = { cells: { ck: [{val, row}] }, values: [{val, row}], rows: [row] }
+  // Cell entries store the aggregated value AND the source row, so aggregators
+  // like sum-where / count-where / expr can access other fields of the row.
   function computePivot(data, config) {
     var rowFields = config.rowFields;
     var colFields = config.colFields;
-    var valueField = config.valueField;
+    var measures = (config.measures && config.measures.length) ? config.measures : [{ field: config.valueField || '', aggregator: config.aggregator || 'count' }];
+    var primaryField = measures[0].field || config.valueField || '';
     if (!data.length) return { tree: {}, colValues: [], rowKeys: [], rowFieldValues: {} };
 
     var colSet = new Set();
@@ -493,12 +835,14 @@
       var ck = colParts.join('\x00');
 
       if (colFields.length) colSet.add(ck);
-      if (!tree[rk]) { tree[rk] = { cells: {}, values: [] }; rowFieldValues[rk] = rowParts; }
+      if (!tree[rk]) { tree[rk] = { cells: {}, values: [], rows: [] }; rowFieldValues[rk] = rowParts; }
       if (!tree[rk].cells[ck]) tree[rk].cells[ck] = [];
 
-      var val = valueField ? row[valueField] : (row['_count'] !== undefined ? row['_count'] : '1');
-      tree[rk].cells[ck].push(val);
-      tree[rk].values.push(val);
+      var val = primaryField ? row[primaryField] : (row['_count'] !== undefined ? row['_count'] : '1');
+      var entry = { val: val, row: row };
+      tree[rk].cells[ck].push(entry);
+      tree[rk].values.push(entry);
+      tree[rk].rows.push(row);
 
       // Track counts for weighted avg (backend pivot rows have _pivot_count)
       var cnt = row['_pivot_count'];
@@ -561,12 +905,11 @@
 
   function buildTitleHTML(config) {
     var title = (config.showTitle !== false && config.titleAlias) ? config.titleAlias : '';
+    var dlIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
     return '<div class="pivot-title-bar">' +
       (title ? '<span class="pivot-title-text">' + esc(title) + '</span>' : '<span></span>') +
       '<div class="pivot-toolbar">' +
-      '<button class="pivot-download-btn" data-format="excel" title="Download Excel">' +
-      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
-      ' Excel</button>' +
+      '<button class="pivot-download-btn" data-format="excel" title="Download Excel">' + dlIcon + ' Excel</button>' +
       '</div></div>';
   }
 
@@ -600,7 +943,7 @@
         // Skip columns occupied by rowspan from previous rows
         while (occupied[rowIdx + ',' + colIdx]) { row.push({ v: '', t: 's', sk: '', a: null }); colIdx++; }
 
-        var cell = cells[ci], text = cell.textContent.trim();
+        var cell = cells[ci], text = cell.textContent.replace(/[▸▾]/g, '').trim();
         var colspan = parseInt(cell.getAttribute('colspan') || '1', 10);
         var rowspan = parseInt(cell.getAttribute('rowspan') || '1', 10);
         var isH = cell.tagName === 'TH';
@@ -857,6 +1200,10 @@
     }
   }
 
+
+  // Collapse/expand feature removed
+  function bindCollapseToggles() { /* no-op */ }
+
   // Bind pagination buttons — re-renders pivot on page change
   // serverTotal: if not null, use backend pagination (re-fetch from API)
   function bindPaginationButtons(overlayEl, componentName, data, config, tableEl, serverTotal) {
@@ -874,24 +1221,18 @@
         if (config.backendPivot && pageSize > 0) {
           // Backend paging: re-fetch from API with new page
           overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty"><span class="pivot-spinner"></span> Loading page ' + (page + 1) + '...</div>';
-          executePivotAsync(componentName, config, function (err, rows, total, grandTotals) {
+          executePivotAsync(componentName, config, function (err, rows, total, grandTotals, subtotals) {
             if (err) {
               overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>';
               return;
             }
-            var pData = rows.map(function (row) {
-              var r = {};
-              for (var k in row) {
-                if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
-                r[k] = row[k];
-              }
-              r[config.valueField || '_count'] = row['_pivot_value'];
-              return r;
-            });
+            var pData = reshapeBackendRows(rows, config);
             pData._isBackend = true;
-            overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals);
+            overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals, subtotals);
+            overlayEl._pivotData = pData; overlayEl._pivotServerTotal = total; overlayEl._pivotServerGrandTotals = grandTotals;
             bindDownloadButtons(overlayEl, componentName);
             bindPaginationButtons(overlayEl, componentName, pData, config, tableEl, total);
+            bindCollapseToggles(overlayEl, componentName, pData, config, tableEl, total, grandTotals);
             if (tableEl) adjustPivotHeight(tableEl, overlayEl);
             var scroll = overlayEl.querySelector('.pivot-result-scroll');
             if (scroll) scroll.scrollTop = 0;
@@ -899,8 +1240,10 @@
         } else {
           // Frontend paging: re-render from local data
           overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, componentName);
+          overlayEl._pivotData = data;
           bindDownloadButtons(overlayEl, componentName);
           bindPaginationButtons(overlayEl, componentName, data, config, tableEl);
+          bindCollapseToggles(overlayEl, componentName, data, config, tableEl);
           if (tableEl) adjustPivotHeight(tableEl, overlayEl);
           var scroll = overlayEl.querySelector('.pivot-result-scroll');
           if (scroll) scroll.scrollTop = 0;
@@ -912,36 +1255,108 @@
   // ===================== RENDER PIVOT HTML =====================
   // serverTotal: if provided, data is already paginated by backend (skip local slicing)
   // serverGrandTotals: if provided, use for grand total row instead of computing from page data
-  function renderPivotHTML(data, config, componentName, serverTotal, serverGrandTotals) {
+  // serverSubtotals: if provided, use for subtotal rows (per level)
+  function renderPivotHTML(data, config, componentName, serverTotal, serverGrandTotals, serverSubtotals) {
+    normalizeConfig(config);
     var result = computePivot(data, config);
     var tree = result.tree;
     var countTree = result.countTree || {};
     var colValues = result.colValues;
     var rowKeys = result.rowKeys;
     var rowFieldValues = result.rowFieldValues;
-    var aggFn = AGG[config.aggregator]?.fn || AGG.count.fn;
     var isBackend = serverTotal != null || data._isBackend;
-    // Backend pivot returns pre-aggregated values — count becomes sum of pre-counted values
-    if (isBackend && config.aggregator === 'count') {
-      aggFn = AGG.sum.fn;
-    }
-    // Weighted average helper for backend pre-aggregated avg data
+    var measures = config.measures;
+
+    // Backend pivot returns pre-aggregated values.
+    // For count: sum the pre-counted values. For others: aggregator stays the same but applied to partials.
     var hasCountTree = Object.keys(countTree).length > 0;
-    var useWeightedAvg = isBackend && config.aggregator === 'avg' && hasCountTree;
-    function weightedAvg(values, counts) {
-      if (!counts || counts.length !== values.length) return aggFn(values);
-      var sumProduct = 0, sumCounts = 0;
-      for (var wi = 0; wi < values.length; wi++) {
-        var wv = parseFloat(values[wi]) || 0;
-        var wc = parseFloat(counts[wi]) || 0;
-        sumProduct += wv * wc;
-        sumCounts += wc;
+
+    // Rebuild cells[] for a specific measure. Priority:
+    //   1. Backend multi-measure: row['__m_' + measure.id]
+    //   2. Legacy: row[measure.field]
+    //   3. Original cells (primary measure fallback)
+    function cellsForMeasure(cells, rows, measure) {
+      if (!measure) return cells || [];
+      if (!rows || !rows.length) return cells || [];
+      var synthKey = '__m_' + measure.id;
+      var hasSynth = rows[0] && rows[0][synthKey] !== undefined;
+      if (!hasSynth && !measure.field) return cells || [];
+      var out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var v = hasSynth ? rows[i][synthKey] : rows[i][measure.field];
+        out.push({ val: v, row: rows[i] });
       }
-      return sumCounts > 0 ? (sumProduct / sumCounts) : 0;
+      return out;
     }
+
+    // Per-measure effective compute (handles backend re-aggregation quirks)
+    function measureCompute(measure, cells, rows) {
+      var reg = AGG_REGISTRY[measure.aggregator];
+      if (!reg) return '';
+      var mCells = cellsForMeasure(cells, rows, measure);
+      if (isBackend) {
+        // Backend pivot: values in mCells are ALREADY aggregated (e.g. SUM(CASE WHEN ...)).
+        // Frontend must re-aggregate partials, not re-run the aggregator.
+        var agg = measure.aggregator;
+        // Sum-style (sum, count, sum-where, count-where, cum-sum, cum-count, share): sum partials
+        if (agg === 'count' || agg === 'sum' || agg === 'sum-where' || agg === 'count-where' ||
+            agg === 'cum-sum' || agg === 'cum-count' || agg === 'share') {
+          var s = 0;
+          for (var i = 0; i < mCells.length; i++) { var x = parseFloat(mCells[i].val); if (!isNaN(x)) s += x; }
+          return s;
+        }
+        // Min / Max: take min/max of partials
+        if (agg === 'min' || agg === 'max') {
+          var nums = [];
+          for (var j = 0; j < mCells.length; j++) { var n = parseFloat(mCells[j].val); if (!isNaN(n)) nums.push(n); }
+          if (!nums.length) return '';
+          return agg === 'min' ? Math.min.apply(null, nums) : Math.max.apply(null, nums);
+        }
+        // Avg: weighted avg handled by caller (computeCell's useWeighted branch); fall back to average of partials
+        if (agg === 'avg') {
+          var a = 0, c = 0;
+          for (var k = 0; k < mCells.length; k++) { var v = parseFloat(mCells[k].val); if (!isNaN(v)) { a += v; c++; } }
+          return c ? a / c : 0;
+        }
+        // expr: for backend, the SQL returned a pre-computed value per cell. Just sum partials.
+        if (agg === 'expr') {
+          var e = 0;
+          for (var m = 0; m < mCells.length; m++) { var ev = parseFloat(mCells[m].val); if (!isNaN(ev)) e += ev; }
+          return e;
+        }
+        // distinct / median / percentile / stddev / variance: backend returned the single aggregated value
+        // per (rowKey, colKey). If exactly 1 partial, return it; else we can't correctly re-aggregate
+        // (those aggregators are in NON_REAGGREGABLE). Return the single value when possible.
+        if (mCells.length === 1) {
+          var only = parseFloat(mCells[0].val);
+          return isNaN(only) ? (mCells[0].val || '') : only;
+        }
+        // Multiple partials for non-reaggregable agg: best-effort fallback = average
+        var fa = 0, fc = 0;
+        for (var q = 0; q < mCells.length; q++) { var fv = parseFloat(mCells[q].val); if (!isNaN(fv)) { fa += fv; fc++; } }
+        return fc ? fa / fc : 0;
+      }
+      // Frontend pivot: run the aggregator over source rows
+      return reg.compute(mCells, rows || [], measure);
+    }
+
+    // Weighted avg for backend pre-aggregated rows (uses _pivot_count)
+    function weightedAvgCells(cells, countsList) {
+      if (!cells || !cells.length) return 0;
+      if (!countsList || countsList.length !== cells.length) {
+        // Fallback: plain avg
+        var n = 0, s = 0;
+        for (var i = 0; i < cells.length; i++) { var x = parseFloat(cells[i].val); if (!isNaN(x)) { s += x; n++; } }
+        return n ? s / n : 0;
+      }
+      var sp = 0, sc = 0;
+      for (var j = 0; j < cells.length; j++) { var v = parseFloat(cells[j].val) || 0; var c = parseFloat(countsList[j]) || 0; sp += v * c; sc += c; }
+      return sc > 0 ? sp / sc : 0;
+    }
+
     // Store component name for pagination state lookup
     config._componentName = componentName || config._componentName || '';
-    var _serverTotal = serverTotal; // null = frontend paging, number = backend paging
+    var _serverTotal = serverTotal;
 
     if (rowKeys.length === 0) {
       return '<div class="pivot-empty">No data to pivot. Ensure the table has loaded data.</div>';
@@ -950,7 +1365,9 @@
     var rowFields = config.rowFields;
     var colFields = config.colFields;
     var showCols = colValues.length > 0;
-    var showRowTotal = config.showRowTotal !== false || !showCols; // force on when no column fields
+    // Row Total only makes sense when columns exist (sum across columns).
+    // With no col fields, each row has just one cell per measure — total = cell value (redundant).
+    var showRowTotal = config.showRowTotal !== false && showCols;
     var rowTotalLabel = config.rowTotalLabel || 'Total';
     var showGrandTotal = config.showGrandTotal !== false;
     var grandTotalLabel = config.grandTotalLabel || 'Grand Total';
@@ -958,6 +1375,8 @@
     var subtotalLabel = config.subtotalLabel || '{group} Subtotal';
     var numRowCols = rowFields.length || 1;
     var numColFields = colFields.length || 0;
+    var numMeasures = measures.length;
+    var isMulti = numMeasures > 1;
 
     // Alignment styles
     var aRow = config.alignRowFields || 'left';
@@ -974,15 +1393,39 @@
     // Empty cell display
     var emptyVal = config.emptyValue !== undefined ? config.emptyValue : '0';
 
-    // Number formatter: apply configured decimal places
-    var dp = config.decimalPlaces;
-    function fmtNum(v) {
+    // Collapse feature removed
+
+    // Number formatter: supports per-measure decimals/prefix/suffix/format
+    function fmtVal(v, measure) {
       if (v === '' || v === null || v === undefined) return esc(emptyVal);
       var n = parseFloat(v);
       if (isNaN(n)) return esc(String(v));
-      if (dp === 'auto' || dp === undefined || dp === null || dp === '') return String(n);
-      return n.toFixed(parseInt(dp, 10));
+      // Per-measure decimal places override global
+      var mDp = measure && (measure.decimalPlaces !== undefined && measure.decimalPlaces !== '' && measure.decimalPlaces !== null) ? measure.decimalPlaces : config.decimalPlaces;
+      var nf = measure && measure.numberFormat;
+      // For percent: multiply by 100 FIRST, then apply decimals (0.2121 → 21.21, not 0.21 → 21.00)
+      if (nf === 'percent') n = n * 100;
+      var out;
+      if (mDp === 'auto' || mDp === undefined || mDp === null || mDp === '') {
+        // Auto: for percent give 2 decimals by default (so 21.21% not 21.2121333%)
+        if (nf === 'percent') out = n.toFixed(2);
+        else out = String(n);
+      } else {
+        out = n.toFixed(parseInt(mDp, 10));
+      }
+      if (nf === 'percent') {
+        out = out + '%';
+      } else if (nf === 'comma' || nf === 'currency') {
+        var parts = out.split('.');
+        parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        out = parts.join('.');
+      }
+      if (measure && measure.prefix) out = measure.prefix + out;
+      if (measure && measure.suffix) out = out + measure.suffix;
+      return esc(out);
     }
+    // Back-compat fmtNum (no measure)
+    function fmtNum(v) { return fmtVal(v, null); }
 
     // Build inline style from alignment + text style string
     function sf(align, style) {
@@ -998,43 +1441,119 @@
       return ck.split('\x00');
     }
 
+    // Helper: get per-cell value for a measure using its own .field
+    // Handles both backend (synthetic __m_<id>) and frontend (row[field]) cases.
+    function _measureCellVal(row, measure) {
+      var synthKey = '__m_' + measure.id;
+      if (row[synthKey] !== undefined) return row[synthKey];
+      if (measure.field) return row[measure.field];
+      return null;
+    }
+
+    // Cumulative aggs — pre-compute running totals per (col, measure) across row order
+    // Only for FRONTEND pivot. Backend already computed the running total via window function.
+    var cumulativeCache = {};
+    for (var mi = 0; mi < measures.length; mi++) {
+      var mm = measures[mi];
+      var reg = AGG_REGISTRY[mm.aggregator];
+      if (reg && reg.cumulative && !isBackend) {
+        cumulativeCache[mm.id] = {};
+        var cols = showCols ? colValues : [Object.keys(tree[rowKeys[0]] ? tree[rowKeys[0]].cells : {})[0]];
+        for (var cii = 0; cii < cols.length; cii++) {
+          var ck = cols[cii];
+          var acc = 0;
+          cumulativeCache[mm.id][ck] = {};
+          for (var rri = 0; rri < rowKeys.length; rri++) {
+            var rk = rowKeys[rri];
+            var cls = (tree[rk] && tree[rk].cells[ck]) || [];
+            if (mm.aggregator === 'cum-count') acc += cls.length;
+            else {
+              for (var cj = 0; cj < cls.length; cj++) {
+                var xv = parseFloat(_measureCellVal(cls[cj].row, mm));
+                if (!isNaN(xv)) acc += xv;
+              }
+            }
+            cumulativeCache[mm.id][ck][rk] = acc;
+          }
+        }
+      }
+    }
+
+    // Grand total cache for 'share' denominator — uses measure's own .field
+    var shareDenominator = {};
+    for (var smi = 0; smi < measures.length; smi++) {
+      var sm = measures[smi];
+      if (sm.aggregator === 'share') {
+        var tot = 0;
+        for (var srk = 0; srk < rowKeys.length; srk++) {
+          var sv = tree[rowKeys[srk]].rows || [];
+          for (var svk = 0; svk < sv.length; svk++) {
+            var svx = parseFloat(_measureCellVal(sv[svk], sm));
+            if (!isNaN(svx)) tot += svx;
+          }
+        }
+        shareDenominator[sm.id] = tot;
+      }
+    }
+
+    // Compute a single cell value for a given set of cell entries + rows, applying weighted avg / cumulative / share
+    function computeCell(cells, rows, measure, rk, ck) {
+      if (!measure) return '';
+      var reg = AGG_REGISTRY[measure.aggregator];
+      if (!reg) return '';
+      // Weighted avg for backend pre-aggregated — must use per-measure cells (not primary)
+      var useWeighted = isBackend && measure.aggregator === 'avg' && hasCountTree && measure.field === (config.valueField || measures[0].field);
+      if (useWeighted && rk !== undefined && ck !== undefined && countTree[rk] && countTree[rk].cells[ck]) {
+        return weightedAvgCells(cellsForMeasure(cells, rows, measure), countTree[rk].cells[ck]);
+      }
+      // Cumulative: use cache
+      if (reg.cumulative && rk !== undefined && ck !== undefined && cumulativeCache[measure.id] && cumulativeCache[measure.id][ck]) {
+        return cumulativeCache[measure.id][ck][rk] || 0;
+      }
+      var v = measureCompute(measure, cells, rows);
+      // Share: divide by denominator
+      if (measure.aggregator === 'share') {
+        var d = shareDenominator[measure.id] || 0;
+        return d > 0 ? (v / d) : 0;
+      }
+      return v;
+    }
+
+    // Render ONE cell (<td>) for a given measure. Optional classes added.
+    function renderCell(cells, rows, measure, align, style, extraClass, rk, ck) {
+      var v = computeCell(cells || [], rows || [], measure, rk, ck);
+      var text = (cells && cells.length) || measure.aggregator === 'count' || measure.aggregator === 'count-where' || measure.aggregator === 'expr' ? fmtVal(v, measure) : esc(emptyVal);
+      return '<td class="pivot-cell' + (extraClass ? ' ' + extraClass : '') + '"' + sf(align, style) + '>' + text + '</td>';
+    }
+
     var h = '<div class="pivot-result-scroll"><table class="pivot-table"><thead>';
+
+    // Total number of header rows: col fields levels + (1 if multi-measure)
+    var headerRowCount = (showCols ? numColFields : 0) + (isMulti ? 1 : 0);
+    if (headerRowCount === 0) headerRowCount = 1; // single header row for no-col case
+    var measureLabel = function (m) { return m.label || (AGG_REGISTRY[m.aggregator] ? AGG_REGISTRY[m.aggregator].label : m.aggregator) + (m.field ? '(' + m.field + ')' : ''); };
 
     if (showCols && numColFields > 1) {
       // ---- MULTI-LEVEL COLUMN HEADERS ----
-      // Build hierarchical structure for column fields
-      // Each level groups by the values at that depth
-
       for (var level = 0; level < numColFields; level++) {
         h += '<tr>';
 
-        // Row field headers: only on last level row, with rowspan on first level
         if (level === 0) {
           for (var rf = 0; rf < (rowFields.length || 1); rf++) {
-            h += '<th class="pivot-row-header" rowspan="' + numColFields + '">' +
+            h += '<th class="pivot-row-header" rowspan="' + headerRowCount + '">' +
               esc(rowFields.length > 0 ? rowFields[rf] : 'Row') + '</th>';
           }
         }
 
-        // Group colValues by values at levels 0..level
-        var groups = [];
         var lastGroupKey = null;
         for (var ci = 0; ci < colValues.length; ci++) {
           var parts = colParts(colValues[ci]);
-          // Build group key from levels 0..level
-          var groupKey = '';
-          for (var gl = 0; gl <= level; gl++) {
-            groupKey += (gl > 0 ? '\x00' : '') + parts[gl];
-          }
-
           if (level < numColFields - 1) {
-            // Non-leaf level: group by values up to this level
             var parentKey = '';
             for (var pl = 0; pl <= level; pl++) {
               parentKey += (pl > 0 ? '\x00' : '') + parts[pl];
             }
             if (parentKey !== lastGroupKey) {
-              // Count how many colValues share this parentKey
               var span = 0;
               for (var si = ci; si < colValues.length; si++) {
                 var sp = colParts(colValues[si]);
@@ -1045,54 +1564,93 @@
                 if (sk === parentKey) span++;
                 else break;
               }
-              h += '<th class="pivot-col-header" colspan="' + span + '">' + esc(parts[level]) + '</th>';
+              // Each colValue leaf occupies numMeasures cells
+              h += '<th class="pivot-col-header" colspan="' + (span * numMeasures) + '">' + esc(parts[level]) + '</th>';
               lastGroupKey = parentKey;
             }
           } else {
-            // Leaf level: one header per colValue
-            h += '<th class="pivot-col-header">' + esc(parts[level]) + '</th>';
+            // Leaf level: one header per colValue, spanning numMeasures if multi-measure
+            h += '<th class="pivot-col-header"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(parts[level]) + '</th>';
           }
         }
 
         if (level === 0 && showRowTotal) {
-          h += '<th class="pivot-total-header" rowspan="' + numColFields + '">' + esc(rowTotalLabel) + '</th>';
+          h += '<th class="pivot-total-header" rowspan="' + headerRowCount + '"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(rowTotalLabel) + '</th>';
         }
+        h += '</tr>';
+      }
+      // Extra measure header row if multi-measure
+      if (isMulti) {
+        h += '<tr>';
+        for (var ci_m = 0; ci_m < colValues.length; ci_m++) {
+          for (var mmi = 0; mmi < numMeasures; mmi++) {
+            h += '<th class="pivot-measure-header">' + esc(measureLabel(measures[mmi])) + '</th>';
+          }
+        }
+        // row total: also one cell per measure (rowspan handled above; this row has measure labels under row-total header)
         h += '</tr>';
       }
 
     } else {
       // ---- SINGLE-LEVEL HEADER (0 or 1 column field) ----
+      // Special case: no col fields → measure labels inline (no "Values" wrapper), works for 1+ measures
+      var noColMeasures = !showCols;
+      var needsMeasureRow = isMulti && showCols;
       h += '<tr>';
       if (rowFields.length > 0) {
         for (var rf2 = 0; rf2 < rowFields.length; rf2++) {
-          h += '<th class="pivot-row-header">' + esc(rowFields[rf2]) + '</th>';
+          h += '<th class="pivot-row-header"' + (needsMeasureRow ? ' rowspan="2"' : '') + '>' + esc(rowFields[rf2]) + '</th>';
         }
       } else {
-        h += '<th class="pivot-row-header">Row</th>';
+        h += '<th class="pivot-row-header"' + (needsMeasureRow ? ' rowspan="2"' : '') + '>Row</th>';
       }
       if (showCols) {
         for (var ci2 = 0; ci2 < colValues.length; ci2++) {
-          h += '<th class="pivot-col-header">' + esc(colParts(colValues[ci2]).join(' / ')) + '</th>';
+          h += '<th class="pivot-col-header"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(colParts(colValues[ci2]).join(' / ')) + '</th>';
+        }
+      } else if (noColMeasures) {
+        // Measure labels directly in header row 1 (single or multi-measure)
+        for (var mh = 0; mh < numMeasures; mh++) {
+          h += '<th class="pivot-col-header">' + esc(measureLabel(measures[mh])) + '</th>';
         }
       }
-      if (showRowTotal) h += '<th class="pivot-total-header">' + esc(rowTotalLabel) + '</th>';
+      if (showRowTotal) h += '<th class="pivot-total-header"' + (needsMeasureRow ? ' rowspan="2" colspan="' + numMeasures + '"' : '') + '>' + esc(rowTotalLabel) + '</th>';
       h += '</tr>';
+      // Multi-measure with col fields: add second row with measure labels under each col value
+      if (needsMeasureRow) {
+        h += '<tr>';
+        for (var ch = 0; ch < colValues.length; ch++) {
+          for (var mmi2 = 0; mmi2 < numMeasures; mmi2++) {
+            h += '<th class="pivot-measure-header">' + esc(measureLabel(measures[mmi2])) + '</th>';
+          }
+        }
+        h += '</tr>';
+      }
     }
 
     h += '</thead><tbody>';
 
-    // Group row keys by first field for subtotals
-    var rowGroups = {};
-    if (showSubtotal) {
-      for (var gi2 = 0; gi2 < rowKeys.length; gi2++) {
-        var firstField = (rowFieldValues[rowKeys[gi2]] || [''])[0];
-        if (!rowGroups[firstField]) rowGroups[firstField] = [];
-        rowGroups[firstField].push(rowKeys[gi2]);
+    // Build nested group tree: by first rowField value, then second, etc.
+    // Used for multi-level subtotals + collapse support.
+    function buildGroupTree(keys) {
+      var root = { children: {}, order: [], keys: [] };
+      for (var i = 0; i < keys.length; i++) {
+        var rk = keys[i];
+        var parts = rowFieldValues[rk] || [];
+        var node = root;
+        for (var lvl = 0; lvl < rowFields.length - 1; lvl++) {
+          var v = parts[lvl];
+          if (!node.children[v]) { node.children[v] = { children: {}, order: [], keys: [], path: (node.path || []).concat([v]) }; node.order.push(v); }
+          node = node.children[v];
+          node.keys.push(rk);
+        }
+        root.keys.push(rk);
       }
+      return root;
     }
 
-    // Render helper for a single data row
-    function renderRow(rk) {
+    // Render one data row
+    function renderDataRow(rk) {
       var rd = tree[rk];
       var parts = rowFieldValues[rk] || [rk];
       var r = '<tr class="pivot-row">';
@@ -1101,48 +1659,173 @@
       }
       if (showCols) {
         for (var cj = 0; cj < colValues.length; cj++) {
-          var vals = rd.cells[colValues[cj]] || [];
-          r += '<td class="pivot-cell"' + sf(aVal, sVal) + '>' + (vals.length ? fmtNum(aggFn(vals)) : esc(emptyVal)) + '</td>';
+          var cells = rd.cells[colValues[cj]] || [];
+          var rowsList = cells.map(function (c) { return c.row; });
+          for (var mi = 0; mi < numMeasures; mi++) {
+            r += renderCell(cells, rowsList, measures[mi], aVal, sVal, null, rk, colValues[cj]);
+          }
+        }
+      } else {
+        for (var mi2 = 0; mi2 < numMeasures; mi2++) {
+          r += renderCell(rd.values, rd.rows, measures[mi2], aVal, sVal, null, rk, '(All)');
         }
       }
       if (showRowTotal) {
-        var rtVal = (useWeightedAvg && countTree[rk]) ? weightedAvg(rd.values, countTree[rk].counts) : aggFn(rd.values);
-        r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + fmtNum(rtVal) + '</td>';
+        // Prefer backend per-row total (correct for non-reaggregable); fallback to re-aggregating cells
+        // Special case: no row fields → use overall grand total row (same as Grand Total row's Row Total)
+        var leafRow = null;
+        if (rowFields.length > 0) {
+          var leafLevel = rowFields.length - 1;
+          var leafPathKey = (rowFieldValues[rk] || []).slice(0, leafLevel + 1).join('\x00');
+          leafRow = subtotalOverallLookup[leafLevel + ':' + leafPathKey];
+        } else if (serverGrandTotals && serverGrandTotals.length) {
+          for (var gi = 0; gi < serverGrandTotals.length; gi++) {
+            if (serverGrandTotals[gi]._pivot_overall) { leafRow = serverGrandTotals[gi]; break; }
+          }
+          if (!leafRow && !colFields.length) leafRow = serverGrandTotals[0];
+        }
+        for (var mi3 = 0; mi3 < numMeasures; mi3++) {
+          var bv;
+          if (leafRow) {
+            bv = leafRow['_pivot_m_' + mi3];
+            if (bv === undefined && mi3 === 0) bv = leafRow['_pivot_value'];
+          }
+          if (bv !== undefined) {
+            var v = measures[mi3].aggregator === 'share'
+              ? stShareAdjust(bv, mi3)
+              : bv;
+            r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + fmtVal(v, measures[mi3]) + '</td>';
+          } else {
+            r += renderCell(rd.values, rd.rows, measures[mi3], aRT, sRT, 'pivot-total-cell', rk, null);
+          }
+        }
       }
       r += '</tr>';
       return r;
     }
 
-    // Render subtotal row for a group
-    function renderSubtotalRow(groupKeys, groupLabel) {
-      var stLabel = subtotalLabel.replace(/\{group\}/gi, groupLabel || '');
+    // Render subtotal row for a group (can be any level)
+    // path: array of values identifying the group (e.g. ["APAC","Japan"])
+    // depth: which row-field level the label sits in (0 = first)
+    // groupKeys: all rowKeys under this group
+    // Build lookup for server-provided subtotals by (level, rowPath, colKey)
+    var subtotalLookup = {};
+    var subtotalOverallLookup = {};
+    // Share adjustment helper (needed by both subtotal and data rows)
+    function stShareAdjust(val, mi) {
+      if (val === undefined || val === null) return val;
+      var m = measures[mi];
+      if (!m || m.aggregator !== 'share') return val;
+      var denom = NaN;
+      if (serverGrandTotals && serverGrandTotals.length) {
+        for (var gi = 0; gi < serverGrandTotals.length; gi++) {
+          var gRow = serverGrandTotals[gi];
+          if (gRow._pivot_overall || !colFields.length) {
+            var dv = gRow['_pivot_m_' + mi];
+            if (dv === undefined && mi === 0) dv = gRow['_pivot_value'];
+            denom = parseFloat(dv);
+            break;
+          }
+        }
+      }
+      if (!isNaN(denom) && denom > 0) return parseFloat(val) / denom;
+      return val;
+    }
+    if (serverSubtotals && serverSubtotals.length) {
+      for (var sti = 0; sti < serverSubtotals.length; sti++) {
+        var srow = serverSubtotals[sti];
+        var lvl = srow._pivot_subtotal_level;
+        if (lvl === undefined) continue;
+        var rowPathParts = [];
+        for (var rli = 0; rli <= lvl; rli++) rowPathParts.push(srow[rowFields[rli]] ?? '(empty)');
+        var rowPathKey = rowPathParts.join('\x00');
+        if (srow._pivot_overall) {
+          subtotalOverallLookup[lvl + ':' + rowPathKey] = srow;
+        } else {
+          var colParts_ = colFields.length ? colFields.map(function (f) { return srow[f] ?? '(empty)'; }) : [];
+          var colKey_ = colParts_.join('\x00');
+          subtotalLookup[lvl + ':' + rowPathKey + ':' + colKey_] = srow;
+        }
+      }
+    }
+
+    // Simple subtotal row: label spanning all row-field cols + per-cell aggregate values
+    // Uses server subtotals when available (for non-reaggregable aggregators)
+    function renderSubtotalRow(path, depth, groupKeys, groupLabel) {
+      var stLabel = subtotalLabel.replace(/\{group\}/gi, groupLabel || (path.length ? path[path.length - 1] : ''));
       var r = '<tr class="pivot-subtotal">';
       r += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aST, sST) + '>' + esc(stLabel) + '</td>';
+      // Lookup key
+      var rowPathKey = path.join('\x00');
+      function srvCellVal(colKey, mi) {
+        var row = subtotalLookup[depth + ':' + rowPathKey + ':' + colKey];
+        if (!row) return undefined;
+        if (row['_pivot_m_' + mi] !== undefined) return row['_pivot_m_' + mi];
+        if (mi === 0 && row['_pivot_value'] !== undefined) return row['_pivot_value'];
+        return undefined;
+      }
+      function srvOverallVal(mi) {
+        var row = subtotalOverallLookup[depth + ':' + rowPathKey];
+        if (!row) {
+          // If no col fields, the main subtotalLookup with empty colKey IS the overall
+          if (!colFields.length) row = subtotalLookup[depth + ':' + rowPathKey + ':'];
+        }
+        if (!row) return undefined;
+        if (row['_pivot_m_' + mi] !== undefined) return row['_pivot_m_' + mi];
+        if (mi === 0 && row['_pivot_value'] !== undefined) return row['_pivot_value'];
+        return undefined;
+      }
+      // Aggregate cells across groupKeys
+      function collectCells(ck) {
+        var out = [], outRows = [];
+        for (var i = 0; i < groupKeys.length; i++) {
+          var cs = (tree[groupKeys[i]] && tree[groupKeys[i]].cells[ck]) || [];
+          for (var j = 0; j < cs.length; j++) { out.push(cs[j]); outRows.push(cs[j].row); }
+        }
+        return { cells: out, rows: outRows };
+      }
+      function collectAll() {
+        var out = [], outRows = [];
+        for (var i = 0; i < groupKeys.length; i++) {
+          var v = tree[groupKeys[i]].values;
+          for (var j = 0; j < v.length; j++) { out.push(v[j]); outRows.push(v[j].row); }
+        }
+        return { cells: out, rows: outRows };
+      }
+      var hasServerSubtotal = Object.keys(subtotalLookup).length > 0 || Object.keys(subtotalOverallLookup).length > 0;
       if (showCols) {
         for (var sc = 0; sc < colValues.length; sc++) {
-          var subVals = [], subCnts = [];
-          for (var sg = 0; sg < groupKeys.length; sg++) {
-            var cv2 = tree[groupKeys[sg]].cells[colValues[sc]] || [];
-            for (var sv = 0; sv < cv2.length; sv++) subVals.push(cv2[sv]);
-            if (useWeightedAvg && countTree[groupKeys[sg]] && countTree[groupKeys[sg]].cells[colValues[sc]]) {
-              var cc2 = countTree[groupKeys[sg]].cells[colValues[sc]];
-              for (var cv3 = 0; cv3 < cc2.length; cv3++) subCnts.push(cc2[cv3]);
+          for (var mi = 0; mi < numMeasures; mi++) {
+            var v = hasServerSubtotal ? srvCellVal(colValues[sc], mi) : undefined;
+            if (v !== undefined) {
+              r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v, mi), measures[mi]) + '</td>';
+            } else {
+              var cc = collectCells(colValues[sc]);
+              r += renderCell(cc.cells, cc.rows, measures[mi], aST, sST, null);
             }
           }
-          r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtNum(useWeightedAvg ? weightedAvg(subVals, subCnts) : aggFn(subVals)) + '</td>';
+        }
+      } else {
+        for (var mi2 = 0; mi2 < numMeasures; mi2++) {
+          var v2 = hasServerSubtotal ? srvOverallVal(mi2) : undefined;
+          if (v2 !== undefined) {
+            r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v2, mi2), measures[mi2]) + '</td>';
+          } else {
+            var allG = collectAll();
+            r += renderCell(allG.cells, allG.rows, measures[mi2], aST, sST, null);
+          }
         }
       }
       if (showRowTotal) {
-        var subTotal = [], subTotalCnts = [];
-        for (var st = 0; st < groupKeys.length; st++) {
-          var stv = tree[groupKeys[st]].values;
-          for (var st2 = 0; st2 < stv.length; st2++) subTotal.push(stv[st2]);
-          if (useWeightedAvg && countTree[groupKeys[st]]) {
-            var stc = countTree[groupKeys[st]].counts;
-            for (var st3 = 0; st3 < stc.length; st3++) subTotalCnts.push(stc[st3]);
+        for (var mi3 = 0; mi3 < numMeasures; mi3++) {
+          var v3 = hasServerSubtotal ? srvOverallVal(mi3) : undefined;
+          if (v3 !== undefined) {
+            r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v3, mi3), measures[mi3]) + '</td>';
+          } else {
+            var allRT = collectAll();
+            r += renderCell(allRT.cells, allRT.rows, measures[mi3], aST, sST, 'pivot-total-cell');
           }
         }
-        r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + fmtNum(useWeightedAvg ? weightedAvg(subTotal, subTotalCnts) : aggFn(subTotal)) + '</td>';
       }
       r += '</tr>';
       return r;
@@ -1157,136 +1840,174 @@
     if (currentPage >= totalPages) currentPage = Math.max(0, totalPages - 1);
 
     // Determine which row keys to show on this page
-    var pageRowKeys, pageRowGroups;
+    var pageRowKeys;
     if (isBackendPaged) {
-      // Backend already returned only the current page's data — no slicing needed
       pageRowKeys = rowKeys;
-      pageRowGroups = rowGroups;
     } else if (pageSize > 0) {
       var startIdx = currentPage * pageSize;
       var endIdx = Math.min(startIdx + pageSize, totalDataRows);
       pageRowKeys = rowKeys.slice(startIdx, endIdx);
-
-      // Rebuild row groups for paginated keys (for subtotals)
-      if (showSubtotal) {
-        pageRowGroups = {};
-        for (var pri = 0; pri < pageRowKeys.length; pri++) {
-          var pFirstField = (rowFieldValues[pageRowKeys[pri]] || [''])[0];
-          if (!pageRowGroups[pFirstField]) pageRowGroups[pFirstField] = [];
-          pageRowGroups[pFirstField].push(pageRowKeys[pri]);
-        }
-      }
     } else {
       pageRowKeys = rowKeys;
-      pageRowGroups = rowGroups;
     }
 
-    // Data rows (with optional subtotals)
+    // ---- RENDER BODY ----
+    // Render data rows; if showSubtotal, insert "{group} Subtotal" row after each first-level group
     if (showSubtotal) {
-      var groupOrder = Object.keys(pageRowGroups).sort();
-      for (var gIdx = 0; gIdx < groupOrder.length; gIdx++) {
-        var gKey = groupOrder[gIdx];
-        var gRows = pageRowGroups[gKey];
-        for (var gri = 0; gri < gRows.length; gri++) {
-          h += renderRow(gRows[gri]);
+      var groupTree = buildGroupTree(pageRowKeys);
+      function renderGroup(node, depth) {
+        if (depth >= rowFields.length - 1 || !node.order || !node.order.length) {
+          for (var li = 0; li < node.keys.length; li++) {
+            h += renderDataRow(node.keys[li]);
+          }
+          return;
         }
-        if (gRows.length > 1 || groupOrder.length > 1) {
-          h += renderSubtotalRow(gRows, gKey);
+        var seen = {};
+        for (var oi = 0; oi < node.order.length; oi++) {
+          var gVal = node.order[oi];
+          if (seen[gVal]) continue; seen[gVal] = true;
+          var child = node.children[gVal]; if (!child) continue;
+          var childPath = (node.path || []).concat([gVal]);
+          renderGroup(child, depth + 1);
+          h += renderSubtotalRow(childPath, depth, child.keys, gVal);
         }
       }
+      renderGroup(groupTree, 0);
     } else {
       for (var ri = 0; ri < pageRowKeys.length; ri++) {
-        h += renderRow(pageRowKeys[ri]);
+        h += renderDataRow(pageRowKeys[ri]);
       }
     }
 
-    // Grand total row
+    // ---- GRAND TOTAL ROW ----
     if (showGrandTotal) {
       h += '<tr class="pivot-grand-total">';
       h += '<td class="pivot-row-label" colspan="' + numRowCols + '"' + sf(aGT, sGT) + '>' + esc(grandTotalLabel) + '</td>';
 
-      if (isBackendPaged && serverGrandTotals && serverGrandTotals.length > 0) {
-        // Use server-computed grand totals (accurate across ALL data, not just current page)
-        if (showCols) {
-          // Build lookup: colKey -> _pivot_value from server grand totals
-          var gtMap = {};
-          for (var gti = 0; gti < serverGrandTotals.length; gti++) {
-            var gtRow = serverGrandTotals[gti];
-            var gtColParts = colFields.length ? colFields.map(function (f) { return gtRow[f] ?? '(empty)'; }) : [];
-            var gtKey = gtColParts.join('\x00');
-            gtMap[gtKey] = gtRow._pivot_value;
+      // Collect all cells across all rowKeys (for per-column grand total)
+      function collectColCells(ck) {
+        var cells = [], rows = [];
+        for (var i = 0; i < rowKeys.length; i++) {
+          var cs = (tree[rowKeys[i]] && tree[rowKeys[i]].cells[ck]) || [];
+          for (var j = 0; j < cs.length; j++) { cells.push(cs[j]); rows.push(cs[j].row); }
+        }
+        return { cells: cells, rows: rows };
+      }
+      function collectAllGT() {
+        var cells = [], rows = [];
+        for (var i = 0; i < rowKeys.length; i++) {
+          var v = tree[rowKeys[i]].values;
+          for (var j = 0; j < v.length; j++) { cells.push(v[j]); rows.push(v[j].row); }
+        }
+        return { cells: cells, rows: rows };
+      }
+
+      if (serverGrandTotals && serverGrandTotals.length > 0) {
+        // Use server-computed grand totals — correct for ALL aggregators (including non-reaggregable)
+        // Server rows have _pivot_m_0, _pivot_m_1, ... columns (multi-measure) and optionally _pivot_value (single-measure back-compat)
+        // Build lookup: colKey → gtRow
+        var gtMap = {};
+        var overallRow = null;
+        for (var gti = 0; gti < serverGrandTotals.length; gti++) {
+          var gtRow = serverGrandTotals[gti];
+          if (gtRow._pivot_overall) {
+            overallRow = gtRow; // explicit overall row from backend (no col grouping)
+            continue;
           }
-          for (var ck = 0; ck < colValues.length; ck++) {
-            var gtVal = gtMap[colValues[ck]];
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (gtVal !== undefined ? fmtNum(gtVal) : esc(emptyVal)) + '</td>';
+          if (colFields.length) {
+            var gtColParts = colFields.map(function (f) { return gtRow[f] ?? '(empty)'; });
+            gtMap[gtColParts.join('\x00')] = gtRow;
+          } else {
+            overallRow = gtRow; // no col fields → single row IS the overall
+          }
+        }
+        function gtValForMeasure(row, mi) {
+          if (!row) return undefined;
+          if (row['_pivot_m_' + mi] !== undefined) return row['_pivot_m_' + mi];
+          if (mi === 0 && row['_pivot_value'] !== undefined) return row['_pivot_value'];
+          return undefined;
+        }
+        // For share measures: the displayed value must be divided by overall total (denominator)
+        // so Grand Total row shows column_sum / overall_sum (a percentage).
+        function applyShareAdjustment(val, mi) {
+          if (val === undefined || val === null) return val;
+          var m = measures[mi];
+          if (!m || m.aggregator !== 'share') return val;
+          var total = overallRow ? parseFloat(gtValForMeasure(overallRow, mi)) : NaN;
+          if (!isNaN(total) && total > 0) return parseFloat(val) / total;
+          return val;
+        }
+        if (showCols) {
+          for (var ck_ = 0; ck_ < colValues.length; ck_++) {
+            var rowCK = gtMap[colValues[ck_]];
+            for (var mi_ = 0; mi_ < numMeasures; mi_++) {
+              var v__ = applyShareAdjustment(gtValForMeasure(rowCK, mi_), mi_);
+              h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (v__ !== undefined ? fmtVal(v__, measures[mi_]) : esc(emptyVal)) + '</td>';
+            }
           }
         } else {
-          // No column fields: server returns single overall total
-          // (handled by showRowTotal below)
+          for (var mi_no = 0; mi_no < numMeasures; mi_no++) {
+            var vNC = applyShareAdjustment(gtValForMeasure(overallRow, mi_no), mi_no);
+            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (vNC !== undefined ? fmtVal(vNC, measures[mi_no]) : esc(emptyVal)) + '</td>';
+          }
         }
         if (showRowTotal) {
-          // Overall total: for avg use weighted average, for others sum
-          var gtDisplay;
-          if (config.aggregator === 'avg') {
-            var gtSumProd = 0, gtSumCnt = 0;
-            for (var gts = 0; gts < serverGrandTotals.length; gts++) {
-              var gtv = parseFloat(serverGrandTotals[gts]._pivot_value) || 0;
-              var gtc = parseFloat(serverGrandTotals[gts]._pivot_count) || 0;
-              gtSumProd += gtv * gtc;
-              gtSumCnt += gtc;
-            }
-            gtDisplay = gtSumCnt > 0 ? (gtSumProd / gtSumCnt) : 0;
-          } else if (config.aggregator === 'min') {
-            gtDisplay = Infinity;
-            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
-              var gtv2 = parseFloat(serverGrandTotals[gts2]._pivot_value);
-              if (!isNaN(gtv2) && gtv2 < gtDisplay) gtDisplay = gtv2;
-            }
-            if (gtDisplay === Infinity) gtDisplay = 0;
-          } else if (config.aggregator === 'max') {
-            gtDisplay = -Infinity;
-            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
-              var gtv2 = parseFloat(serverGrandTotals[gts2]._pivot_value);
-              if (!isNaN(gtv2) && gtv2 > gtDisplay) gtDisplay = gtv2;
-            }
-            if (gtDisplay === -Infinity) gtDisplay = 0;
-          } else {
-            // sum, count: sum of per-column values
-            var gtSum = 0;
-            for (var gts2 = 0; gts2 < serverGrandTotals.length; gts2++) {
-              gtSum += parseFloat(serverGrandTotals[gts2]._pivot_value) || 0;
-            }
-            gtDisplay = gtSum;
-          }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + fmtNum(gtDisplay) + '</td>';
-        }
-      } else {
-        // Frontend computation (non-paginated or no server grand totals)
-        if (showCols) {
-          for (var ck = 0; ck < colValues.length; ck++) {
-            var colTotal = [], colTotalCnts = [];
-            for (var rri = 0; rri < rowKeys.length; rri++) {
-              var cv = tree[rowKeys[rri]].cells[colValues[ck]] || [];
-              for (var vi = 0; vi < cv.length; vi++) colTotal.push(cv[vi]);
-              if (useWeightedAvg && countTree[rowKeys[rri]] && countTree[rowKeys[rri]].cells[colValues[ck]]) {
-                var ccv = countTree[rowKeys[rri]].cells[colValues[ck]];
-                for (var vi2 = 0; vi2 < ccv.length; vi2++) colTotalCnts.push(ccv[vi2]);
+          // Row total = aggregate across all columns. For most aggregators we can compute via
+          // cross-column reduction; for non-reaggregable, we use the overall grand total row (computed without GROUP BY colFields).
+          // Use overallRow if available (no col fields case); otherwise compute by reducing per-column server values.
+          for (var mi3 = 0; mi3 < numMeasures; mi3++) {
+            var m3 = measures[mi3];
+            var gtDisplay;
+            if (overallRow) {
+              gtDisplay = applyShareAdjustment(gtValForMeasure(overallRow, mi3), mi3);
+            } else {
+              // Reduce across per-column server values (sum for sum-like, avg with weight for avg, etc.)
+              var vals = [];
+              for (var ck2 = 0; ck2 < colValues.length; ck2++) {
+                var r_ = gtMap[colValues[ck2]];
+                var v_ = r_ ? gtValForMeasure(r_, mi3) : undefined;
+                if (v_ !== undefined && v_ !== null) vals.push(parseFloat(v_));
+              }
+              if (m3.aggregator === 'avg' || m3.aggregator === 'share') {
+                var sum_ = 0, n_ = 0;
+                for (var z_ = 0; z_ < vals.length; z_++) { if (!isNaN(vals[z_])) { sum_ += vals[z_]; n_++; } }
+                gtDisplay = n_ ? sum_ / n_ : 0;
+              } else if (m3.aggregator === 'min') {
+                gtDisplay = vals.length ? Math.min.apply(null, vals) : '';
+              } else if (m3.aggregator === 'max') {
+                gtDisplay = vals.length ? Math.max.apply(null, vals) : '';
+              } else {
+                // sum, count, sum-where, count-where, cum-sum, cum-count, expr, distinct, median, stddev, percentile, variance
+                // For non-reaggregable: best approximation is server's per-column value; user should check grand total source.
+                // For sum-like: sum of partials.
+                var s2 = 0;
+                for (var z2 = 0; z2 < vals.length; z2++) { if (!isNaN(vals[z2])) s2 += vals[z2]; }
+                gtDisplay = s2;
               }
             }
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + fmtNum(useWeightedAvg ? weightedAvg(colTotal, colTotalCnts) : aggFn(colTotal)) + '</td>';
+            h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + (gtDisplay !== undefined && gtDisplay !== null && gtDisplay !== '' ? fmtVal(gtDisplay, m3) : esc(emptyVal)) + '</td>';
+          }
+        }
+      } else {
+        // Frontend computation via registry
+        if (showCols) {
+          for (var ck_fe = 0; ck_fe < colValues.length; ck_fe++) {
+            var cc = collectColCells(colValues[ck_fe]);
+            for (var mi = 0; mi < numMeasures; mi++) {
+              h += renderCell(cc.cells, cc.rows, measures[mi], aGT, sGT, null);
+            }
+          }
+        } else {
+          var allNoCol = collectAllGT();
+          for (var mi2 = 0; mi2 < numMeasures; mi2++) {
+            h += renderCell(allNoCol.cells, allNoCol.rows, measures[mi2], aGT, sGT, null);
           }
         }
         if (showRowTotal) {
-          var grandVals = [], grandCnts = [];
-          for (var gvi = 0; gvi < rowKeys.length; gvi++) {
-            var gv = tree[rowKeys[gvi]].values;
-            for (var gvj = 0; gvj < gv.length; gvj++) grandVals.push(gv[gvj]);
-            if (useWeightedAvg && countTree[rowKeys[gvi]]) {
-              var gc = countTree[rowKeys[gvi]].counts;
-              for (var gcj = 0; gcj < gc.length; gcj++) grandCnts.push(gc[gcj]);
-            }
+          var allRT = collectAllGT();
+          for (var mi3 = 0; mi3 < numMeasures; mi3++) {
+            h += renderCell(allRT.cells, allRT.rows, measures[mi3], aGT, sGT, 'pivot-total-cell');
           }
-          h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + fmtNum(useWeightedAvg ? weightedAvg(grandVals, grandCnts) : aggFn(grandVals)) + '</td>';
         }
       }
       h += '</tr>';
@@ -1495,29 +2216,17 @@
       h += buildOrderedPicker('colFields', config.colFields);
       h += '</div>';
 
-      // Value Field (excludes fields already used in Row/Column Fields)
-      var usedFields = (config.rowFields || []).concat(config.colFields || []);
-      h += '<div class="pivot-prop-row">';
-      h += '<label class="pivot-prop-label">Value Field</label>';
-      h += '<select class="pivot-cfg-select pivot-cfg-valueField">';
-      h += '<option value="">(Count rows)</option>';
-      for (var i = 0; i < cachedColumns.length; i++) {
-        var c = cachedColumns[i];
-        if (usedFields.indexOf(c) !== -1) continue; // skip fields used in row/col
-        h += '<option value="' + esc(c) + '"' + (config.valueField === c ? ' selected' : '') + '>' + esc(c) + '</option>';
+      // --- Measures section (replaces single Value Field + Aggregation) ---
+      h += '<div class="pivot-section-label">Measures</div>';
+      h += '<div class="pivot-measures-list" data-zone="measures">';
+      var mList = config.measures || [];
+      for (var mi = 0; mi < mList.length; mi++) {
+        h += buildMeasureRow(mList[mi], mi, config);
       }
-      h += '</select></div>';
-
-      // Aggregation
+      h += '</div>';
       h += '<div class="pivot-prop-row">';
-      h += '<label class="pivot-prop-label">Aggregation</label>';
-      h += '<select class="pivot-cfg-select pivot-cfg-aggregator">';
-      var aggKeys = Object.keys(AGG);
-      for (var j = 0; j < aggKeys.length; j++) {
-        var k = aggKeys[j];
-        h += '<option value="' + k + '"' + (config.aggregator === k ? ' selected' : '') + '>' + AGG[k].label + '</option>';
-      }
-      h += '</select></div>';
+      h += '<button class="pivot-add-measure-btn" type="button">+ Add Measure</button>';
+      h += '</div>';
 
       // --- Backend Pivot section (always visible, auto-detect controls editability) ---
       h += '<div class="pivot-backend-section">';
@@ -1623,6 +2332,104 @@
       return h;
     }
 
+    // Build a single measure row (collapsible detail panel)
+    function buildMeasureRow(measure, idx, config) {
+      var usedFields = (config.rowFields || []).concat(config.colFields || []);
+      var aggKeys = Object.keys(AGG_REGISTRY);
+      var reg = AGG_REGISTRY[measure.aggregator] || AGG_REGISTRY.count;
+      var needsField = measure.aggregator !== 'count' && measure.aggregator !== 'count-where' && measure.aggregator !== 'expr';
+      var h = '<div class="pivot-measure-row" data-midx="' + idx + '" data-mid="' + esc(measure.id) + '">';
+      // Summary (always visible)
+      h += '<div class="pivot-measure-summary">';
+      h += '<span class="pivot-measure-drag" title="Drag to reorder">&#x2630;</span>';
+      h += '<span class="pivot-measure-label">' + esc(measure.label || (reg.label + (measure.field ? '(' + measure.field + ')' : ''))) + '</span>';
+      h += '<span class="pivot-measure-toggle" data-midx="' + idx + '" title="Edit">&#9881;</span>';
+      if ((config.measures || []).length > 1) {
+        h += '<span class="pivot-measure-remove" data-midx="' + idx + '" title="Remove">&times;</span>';
+      }
+      h += '</div>';
+      // Detail panel (toggle open)
+      h += '<div class="pivot-measure-detail" style="display:none">';
+      // Aggregator
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Aggregation</label>';
+      h += '<select class="pivot-measure-agg pivot-cfg-select" data-midx="' + idx + '">';
+      for (var ai = 0; ai < aggKeys.length; ai++) {
+        var ak = aggKeys[ai];
+        h += '<option value="' + ak + '"' + (measure.aggregator === ak ? ' selected' : '') + '>' + AGG_REGISTRY[ak].label + '</option>';
+      }
+      h += '</select></div>';
+      // Field (hidden for count/count-where/expr)
+      h += '<div class="pivot-prop-row pivot-measure-field-row"' + (needsField ? '' : ' style="display:none"') + '>';
+      h += '<label class="pivot-prop-label">Field</label>';
+      h += '<select class="pivot-measure-field pivot-cfg-select" data-midx="' + idx + '">';
+      h += '<option value="">(none)</option>';
+      for (var ci = 0; ci < cachedColumns.length; ci++) {
+        var c = cachedColumns[ci];
+        if (usedFields.indexOf(c) !== -1) continue;
+        h += '<option value="' + esc(c) + '"' + (measure.field === c ? ' selected' : '') + '>' + esc(c) + '</option>';
+      }
+      h += '</select></div>';
+      // Percentile
+      h += '<div class="pivot-prop-row pivot-measure-pct-row"' + (measure.aggregator === 'percentile' ? '' : ' style="display:none"') + '>';
+      h += '<label class="pivot-prop-label">Percentile</label>';
+      h += '<input type="number" class="pivot-cfg-input pivot-measure-pct" data-midx="' + idx + '" min="0" max="1" step="0.01" value="' + (measure.percentile !== undefined ? measure.percentile : 0.95) + '"/>';
+      h += '</div>';
+      // Where clause (sum-where / count-where)
+      h += '<div class="pivot-measure-where-row"' + ((measure.aggregator === 'sum-where' || measure.aggregator === 'count-where') ? '' : ' style="display:none"') + '>';
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Where field</label>';
+      h += '<select class="pivot-measure-where-field pivot-cfg-select" data-midx="' + idx + '">';
+      h += '<option value="">(none)</option>';
+      for (var wi = 0; wi < cachedColumns.length; wi++) {
+        var wc = cachedColumns[wi];
+        var curF = measure.where && measure.where.field;
+        h += '<option value="' + esc(wc) + '"' + (curF === wc ? ' selected' : '') + '>' + esc(wc) + '</option>';
+      }
+      h += '</select></div>';
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Op</label>';
+      h += '<select class="pivot-measure-where-op pivot-cfg-select" data-midx="' + idx + '">';
+      var ops = ['=', '!=', '>', '<', '>=', '<=', 'like', 'is null', 'is not null'];
+      var curOp = (measure.where && measure.where.op) || '=';
+      for (var oi = 0; oi < ops.length; oi++) { h += '<option value="' + ops[oi] + '"' + (curOp === ops[oi] ? ' selected' : '') + '>' + ops[oi] + '</option>'; }
+      h += '</select></div>';
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Value</label>';
+      h += '<input type="text" class="pivot-cfg-input pivot-measure-where-val" data-midx="' + idx + '" value="' + esc((measure.where && measure.where.value) || '') + '"/>';
+      h += '</div></div>';
+      // Expression (for expr)
+      h += '<div class="pivot-prop-row pivot-measure-expr-row"' + (measure.aggregator === 'expr' ? '' : ' style="display:none"') + '>';
+      h += '<label class="pivot-prop-label">Expression</label>';
+      h += '<input type="text" class="pivot-cfg-input pivot-measure-expr" data-midx="' + idx + '" value="' + esc(measure.expression || '') + '" placeholder="SUM(revenue) - SUM(cost)"/>';
+      h += '</div>';
+      if (measure._exprError) {
+        h += '<div class="pivot-prop-row pivot-measure-expr-err" style="color:#e5484d;font-size:11px">' + esc(measure._exprError) + '</div>';
+      }
+      // Label
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Label</label>';
+      h += '<input type="text" class="pivot-cfg-input pivot-measure-lbl" data-midx="' + idx + '" value="' + esc(measure.label || '') + '" placeholder="Auto"/>';
+      h += '</div>';
+      // Decimal places
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Decimals</label>';
+      h += '<select class="pivot-measure-dp pivot-cfg-select" data-midx="' + idx + '">';
+      var dpOpts = [['', 'Inherit'], ['auto', 'Auto'], ['0', '0'], ['1', '1'], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6']];
+      var cur = measure.decimalPlaces !== undefined && measure.decimalPlaces !== null ? String(measure.decimalPlaces) : '';
+      for (var di = 0; di < dpOpts.length; di++) { h += '<option value="' + dpOpts[di][0] + '"' + (cur === dpOpts[di][0] ? ' selected' : '') + '>' + dpOpts[di][1] + '</option>'; }
+      h += '</select></div>';
+      // Number format
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Format</label>';
+      h += '<select class="pivot-measure-nf pivot-cfg-select" data-midx="' + idx + '">';
+      var nfOpts = [['', 'Default'], ['comma', 'Comma'], ['percent', 'Percent'], ['currency', 'Currency']];
+      var curNf = measure.numberFormat || '';
+      for (var ni = 0; ni < nfOpts.length; ni++) { h += '<option value="' + nfOpts[ni][0] + '"' + (curNf === nfOpts[ni][0] ? ' selected' : '') + '>' + nfOpts[ni][1] + '</option>'; }
+      h += '</select></div>';
+      // Prefix + Suffix
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Prefix</label>';
+      h += '<input type="text" class="pivot-cfg-input pivot-measure-prefix" data-midx="' + idx + '" value="' + esc(measure.prefix || '') + '" placeholder="$"/></div>';
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Suffix</label>';
+      h += '<input type="text" class="pivot-cfg-input pivot-measure-suffix" data-midx="' + idx + '" value="' + esc(measure.suffix || '') + '" placeholder=""/></div>';
+      h += '</div>'; // end detail
+      h += '</div>';
+      return h;
+    }
+
     // Build a formatting row: label | [align buttons] [B] [I] [U]
     function buildFormatRow(label, suffix, config) {
       var alignKey = 'align' + suffix;
@@ -1706,17 +2513,53 @@
         config.colFields = configCache[wn].colFields.slice();
       }
 
-      var valSel = section.querySelector('.pivot-cfg-valueField');
-      if (valSel) config.valueField = valSel.value;
-      // Clear valueField if it conflicts with row/col fields
-      var allGroupFields = config.rowFields.concat(config.colFields);
-      if (config.valueField && allGroupFields.indexOf(config.valueField) !== -1) {
-        config.valueField = '';
-        if (valSel) valSel.value = '';
+      // --- Measures (source of truth: configCache, read DOM to capture edits) ---
+      var cached = wn && configCache[wn];
+      var baseMeasures = (cached && cached.measures) || config.measures || [{ id: _newMeasureId(), field: '', aggregator: 'count' }];
+      // Read any DOM inputs for current measures and merge
+      var measureRows = section.querySelectorAll('.pivot-measure-row');
+      var newMeasures = [];
+      for (var mi = 0; mi < measureRows.length; mi++) {
+        var mr = measureRows[mi];
+        var midx = parseInt(mr.getAttribute('data-midx'), 10);
+        var base = baseMeasures[midx] || { id: _newMeasureId() };
+        var aggEl = mr.querySelector('.pivot-measure-agg');
+        var fieldEl = mr.querySelector('.pivot-measure-field');
+        var pctEl = mr.querySelector('.pivot-measure-pct');
+        var lblEl = mr.querySelector('.pivot-measure-lbl');
+        var dpEl = mr.querySelector('.pivot-measure-dp');
+        var nfEl = mr.querySelector('.pivot-measure-nf');
+        var prefEl = mr.querySelector('.pivot-measure-prefix');
+        var sufEl = mr.querySelector('.pivot-measure-suffix');
+        var whereFEl = mr.querySelector('.pivot-measure-where-field');
+        var whereOpEl = mr.querySelector('.pivot-measure-where-op');
+        var whereVEl = mr.querySelector('.pivot-measure-where-val');
+        var exprEl = mr.querySelector('.pivot-measure-expr');
+        var m = {
+          id: base.id || _newMeasureId(),
+          aggregator: aggEl ? aggEl.value : (base.aggregator || 'count'),
+          field: fieldEl ? fieldEl.value : (base.field || ''),
+          label: lblEl ? lblEl.value : (base.label || ''),
+          decimalPlaces: dpEl ? (dpEl.value === '' ? undefined : dpEl.value) : base.decimalPlaces,
+          numberFormat: nfEl ? nfEl.value : base.numberFormat,
+          prefix: prefEl ? prefEl.value : (base.prefix || ''),
+          suffix: sufEl ? sufEl.value : (base.suffix || ''),
+        };
+        if (m.aggregator === 'percentile' && pctEl) m.percentile = parseFloat(pctEl.value) || 0.95;
+        if (m.aggregator === 'sum-where' || m.aggregator === 'count-where') {
+          m.where = {
+            field: whereFEl ? whereFEl.value : (base.where && base.where.field) || '',
+            op: whereOpEl ? whereOpEl.value : (base.where && base.where.op) || '=',
+            value: whereVEl ? whereVEl.value : (base.where && base.where.value) || '',
+          };
+        }
+        if (m.aggregator === 'expr' && exprEl) m.expression = exprEl.value;
+        newMeasures.push(m);
       }
-
-      var aggSel = section.querySelector('.pivot-cfg-aggregator');
-      if (aggSel) config.aggregator = aggSel.value;
+      if (newMeasures.length === 0) newMeasures = baseMeasures;
+      config.measures = newMeasures;
+      config.valueField = newMeasures[0].field || '';
+      config.aggregator = newMeasures[0].aggregator || 'count';
 
       var showTitleCb = section.querySelector('.pivot-cfg-showTitle');
       if (showTitleCb) config.showTitle = showTitleCb.checked;
@@ -1738,6 +2581,7 @@
       if (showSubtotal) config.showSubtotal = showSubtotal.checked;
       var subtotalInp = section.querySelector('.pivot-cfg-subtotalLabel');
       if (subtotalInp) config.subtotalLabel = subtotalInp.value || '{group} Subtotal';
+
 
       var backendCb = section.querySelector('.pivot-cfg-backendPivot');
       if (backendCb) config.backendPivot = backendCb.checked;
@@ -1796,6 +2640,18 @@
       sel.innerHTML = oh;
     }
 
+    // Rebuild the entire measures list UI (used after add/remove)
+    function rebuildMeasuresUI(section, config) {
+      var list = section.querySelector('.pivot-measures-list');
+      if (!list) return;
+      normalizeConfig(config);
+      var h = '';
+      for (var i = 0; i < config.measures.length; i++) {
+        h += buildMeasureRow(config.measures[i], i, config);
+      }
+      list.innerHTML = h;
+    }
+
     // Rebuild the Value Field dropdown (exclude fields used in Row/Column Fields)
     function rebuildValueFieldDropdown(section, config) {
       var valSel = section.querySelector('.pivot-cfg-valueField');
@@ -1839,11 +2695,76 @@
         updatePreview(widgetName, config);
       }
 
-      // Enable toggle + value field + aggregation
-      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-valueField, .pivot-cfg-aggregator, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue, .pivot-cfg-decimalPlaces, .pivot-cfg-pageSize');
+      // Enable toggle + simple selects / checkboxes
+      var simpleInputs = section.querySelectorAll('.pivot-cfg-enable, .pivot-cfg-showTitle, .pivot-cfg-showRowTotal, .pivot-cfg-showGrandTotal, .pivot-cfg-showSubtotal, .pivot-cfg-emptyValue, .pivot-cfg-decimalPlaces, .pivot-cfg-pageSize');
       for (var i = 0; i < simpleInputs.length; i++) {
         simpleInputs[i].addEventListener('change', onConfigChange);
       }
+
+      // Measure controls: any change triggers onConfigChange + rebuild
+      section.addEventListener('change', function (e) {
+        var el = e.target;
+        if (el.classList && el.classList.contains('pivot-measure-agg')) {
+          // Aggregator change: show/hide field/percentile/where/expr rows
+          var mr = el.closest('.pivot-measure-row');
+          if (mr) {
+            var needsField = el.value !== 'count' && el.value !== 'count-where' && el.value !== 'expr';
+            var fr = mr.querySelector('.pivot-measure-field-row'); if (fr) fr.style.display = needsField ? '' : 'none';
+            var pr = mr.querySelector('.pivot-measure-pct-row'); if (pr) pr.style.display = el.value === 'percentile' ? '' : 'none';
+            var wr = mr.querySelector('.pivot-measure-where-row'); if (wr) wr.style.display = (el.value === 'sum-where' || el.value === 'count-where') ? '' : 'none';
+            var er = mr.querySelector('.pivot-measure-expr-row'); if (er) er.style.display = el.value === 'expr' ? '' : 'none';
+          }
+          onConfigChange();
+        } else if (el.classList && (el.classList.contains('pivot-measure-field') || el.classList.contains('pivot-measure-dp') ||
+                                   el.classList.contains('pivot-measure-nf') || el.classList.contains('pivot-measure-where-field') ||
+                                   el.classList.contains('pivot-measure-where-op'))) {
+          onConfigChange();
+        }
+      });
+      // Measure text inputs (debounced)
+      section.addEventListener('input', function (e) {
+        var el = e.target;
+        if (el.classList && (el.classList.contains('pivot-measure-lbl') || el.classList.contains('pivot-measure-prefix') ||
+                              el.classList.contains('pivot-measure-suffix') || el.classList.contains('pivot-measure-pct') ||
+                              el.classList.contains('pivot-measure-where-val') || el.classList.contains('pivot-measure-expr'))) {
+          clearTimeout(_debounceTimer);
+          _debounceTimer = setTimeout(onConfigChange, 300);
+        }
+      });
+
+      // Measure row actions (toggle, remove, add)
+      section.addEventListener('click', function (e) {
+        var tgl = e.target.closest('.pivot-measure-toggle, .pivot-measure-summary');
+        if (tgl) {
+          var mr = tgl.closest('.pivot-measure-row');
+          if (mr && !e.target.closest('.pivot-measure-remove')) {
+            var d = mr.querySelector('.pivot-measure-detail');
+            if (d) d.style.display = d.style.display === 'none' ? '' : 'none';
+            e.stopPropagation();
+          }
+        }
+        var rm = e.target.closest('.pivot-measure-remove');
+        if (rm) {
+          e.stopPropagation();
+          var idx = parseInt(rm.getAttribute('data-midx'), 10);
+          var cfg = getConfig(widgetName);
+          if (cfg.measures && cfg.measures.length > 1) {
+            cfg.measures.splice(idx, 1);
+            setConfig(widgetName, cfg);
+            rebuildMeasuresUI(section, cfg);
+            updatePreview(widgetName, cfg);
+          }
+        }
+        var add = e.target.closest('.pivot-add-measure-btn');
+        if (add) {
+          e.stopPropagation();
+          var cfg2 = getConfig(widgetName);
+          cfg2.measures = (cfg2.measures || []).concat([{ id: _newMeasureId(), field: '', aggregator: 'sum', label: '' }]);
+          setConfig(widgetName, cfg2);
+          rebuildMeasuresUI(section, cfg2);
+          updatePreview(widgetName, cfg2);
+        }
+      });
 
       // Backend Pivot — auto-detect if datasource supports SQL
       var backendSection = section.querySelector('.pivot-backend-section');
@@ -1877,11 +2798,10 @@
                 backendCb.disabled = true;
               }
               if (backendInfo) backendInfo.textContent = 'Query: ' + (result.query_name || '?') + ' (' + result.kind + ')';
-              // Ensure config has backendPivot=true and save to DB (fix old bad configs)
               var cfgOn = getConfig(widgetName);
               if (!cfgOn.backendPivot) {
                 cfgOn.backendPivot = true;
-                setConfig(widgetName, cfgOn); // save to memory + localStorage + API
+                setConfig(widgetName, cfgOn);
                 delete _backendPivotCache[widgetName];
                 if (cfgOn.enabled) updatePreview(widgetName, cfgOn);
               }
@@ -1954,6 +2874,7 @@
           // Update UI
           rebuildPicker(section, zone, arr, widgetName);
           rebuildValueFieldDropdown(section, config);
+          rebuildMeasuresUI(section, config);
           updatePreview(widgetName, config);
         });
       }
@@ -2012,7 +2933,7 @@
 
       if (config.enabled && (config.rowFields.length > 0 || config.colFields.length > 0)) {
         // Helper to render pivot data into overlay
-        var renderIntoOverlay = function (data, serverTotal, serverGrandTotals) {
+        var renderIntoOverlay = function (data, serverTotal, serverGrandTotals, serverSubtotals) {
           var ov = tableEl.querySelector('.pivot-overlay');
           var da = tableEl.querySelector('.jet-data-table');
           var ft = tableEl.querySelector('.jet-table-footer');
@@ -2025,9 +2946,11 @@
           if (da) da.style.display = 'none';
           if (ft) ft.style.display = 'none';
           ov.style.display = 'flex';
-          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, widgetName, serverTotal, serverGrandTotals);
+          ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, widgetName, serverTotal, serverGrandTotals, serverSubtotals);
+          ov._pivotData = data; ov._pivotServerTotal = serverTotal; ov._pivotServerGrandTotals = serverGrandTotals; ov._pivotServerSubtotals = serverSubtotals;
           bindDownloadButtons(ov, widgetName);
           bindPaginationButtons(ov, widgetName, data, config, tableEl, serverTotal);
+          bindCollapseToggles(ov, widgetName, data, config, tableEl, serverTotal, serverGrandTotals);
           adjustPivotHeight(tableEl, ov);
         };
 
@@ -2050,7 +2973,7 @@
           showOverlayMsg('<span class="pivot-spinner"></span> <span class="pivot-spinner"></span> Loading...');
           var bpPageSize = config.pageSize || 0;
           var bpPage = bpPageSize > 0 ? getPivotPage(widgetName) : 0;
-          executePivotAsync(widgetName, config, function (err, rows, total, grandTotals) {
+          executePivotAsync(widgetName, config, function (err, rows, total, grandTotals, subtotals) {
             if (err) {
               // Fallback to frontend pivot with notification
               console.warn(LOG_PREFIX, 'Backend pivot failed, falling back to frontend:', err.message);
@@ -2061,17 +2984,9 @@
               });
               return;
             }
-            var data = rows.map(function (row) {
-              var r = {};
-              for (var k in row) {
-                if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
-                r[k] = row[k];
-              }
-              r[config.valueField || '_count'] = row['_pivot_value'];
-              return r;
-            });
+            var data = reshapeBackendRows(rows, config);
             data._isBackend = true;
-            renderIntoOverlay(data, total, grandTotals);
+            renderIntoOverlay(data, total, grandTotals, subtotals);
           }, bpPage, bpPageSize);
         } else {
           // Frontend pivot: extract from DOM
@@ -2284,15 +3199,17 @@
               if (_backendPivotCache[name].data && !kPageSize) {
                 var ov = ensureOverlay();
                 ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(_backendPivotCache[name].data, config, name);
+                ov._pivotData = _backendPivotCache[name].data;
                 bindDownloadButtons(ov, name);
                 bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
+                bindCollapseToggles(ov, name, _backendPivotCache[name].data, config, tableEl);
                 return;
               }
             }
             // Fetch from backend (once, then cache)
             if (_backendPivotPending[name]) return; // already in-flight
             _backendPivotPending[name] = true;
-            executePivotAsync(name, config, function (err, rows, total, grandTotals) {
+            executePivotAsync(name, config, function (err, rows, total, grandTotals, subtotals) {
               _backendPivotPending[name] = false;
               if (err) {
                 // Cache failure to prevent retry loop
@@ -2308,21 +3225,15 @@
                 });
                 return;
               }
-              var data = rows.map(function (row) {
-                var r = {};
-                for (var k in row) {
-                  if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
-                  r[k] = row[k];
-                }
-                r[config.valueField || '_count'] = row['_pivot_value'];
-                return r;
-              });
+              var data = reshapeBackendRows(rows, config);
               data._isBackend = true;
               if (!kPageSize) _backendPivotCache[name] = { data: data, timestamp: Date.now() };
               var ov = ensureOverlay();
-              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, total, grandTotals);
+              ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, total, grandTotals, subtotals);
+              ov._pivotData = data; ov._pivotServerTotal = total; ov._pivotServerGrandTotals = grandTotals;
               bindDownloadButtons(ov, name);
               bindPaginationButtons(ov, name, data, config, tableEl, total);
+              bindCollapseToggles(ov, name, data, config, tableEl, total, grandTotals);
             }, kPage, kPageSize);
           } else {
             // Frontend pivot: extract from DOM
@@ -2330,8 +3241,10 @@
               if (extracted.data.length === 0) return;
               var ov = ensureOverlay();
               ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config, name);
+              ov._pivotData = extracted.data;
               bindDownloadButtons(ov, name);
               bindPaginationButtons(ov, name, extracted.data, config, tableEl);
+              bindCollapseToggles(ov, name, extracted.data, config, tableEl);
             });
           }
         })(tables[i]);
@@ -2393,7 +3306,7 @@
       processedSet.add(tableEl);
       console.log(LOG_PREFIX, 'Applying pivot to', name, 'backendPivot:', !!config.backendPivot);
 
-      function renderPivot(data, serverTotal, serverGrandTotals) {
+      function renderPivot(data, serverTotal, serverGrandTotals, serverSubtotals) {
         var dataArea = tableEl.querySelector('.jet-data-table');
         var footer = tableEl.querySelector('.jet-table-footer');
         if (dataArea) dataArea.style.display = 'none';
@@ -2407,10 +3320,12 @@
           else tableEl.appendChild(overlay);
         }
 
-        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, serverTotal, serverGrandTotals);
+        overlay.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, name, serverTotal, serverGrandTotals, serverSubtotals);
         overlay.style.display = 'flex';
+        overlay._pivotData = data; overlay._pivotServerTotal = serverTotal; overlay._pivotServerGrandTotals = serverGrandTotals; overlay._pivotServerSubtotals = serverSubtotals;
         bindDownloadButtons(overlay, name);
         bindPaginationButtons(overlay, name, data, config, tableEl, serverTotal);
+        bindCollapseToggles(overlay, name, data, config, tableEl, serverTotal, serverGrandTotals);
         adjustPivotHeight(tableEl, overlay);
       }
 
@@ -2450,7 +3365,7 @@
             setTimeout(tryBackendPivot, 1000);
             return;
           }
-          executePivotAsync(name, config, function (err, rows, total, grandTotals) {
+          executePivotAsync(name, config, function (err, rows, total, grandTotals, subtotals) {
             if (err) {
               if (backendAttempts < maxBackendAttempts && err.message && err.message.indexOf('version not detected') !== -1) {
                 setTimeout(tryBackendPivot, 1000);
@@ -2466,19 +3381,11 @@
               }
               return;
             }
-          // Reshape: backend returns flat GROUP BY rows with _pivot_value
-          var data = rows.map(function (row) {
-            var r = {};
-            for (var k in row) {
-              if (k === '_pivot_value' || k === '_pivot_row_rank') continue;
-              r[k] = row[k];
-            }
-            r[config.valueField || '_count'] = row['_pivot_value'];
-            return r;
-          });
+          // Reshape: backend rows → pivot-consumable data (handles multi-measure _pivot_m_<i>)
+          var data = reshapeBackendRows(rows, config);
           data._isBackend = true;
           console.log(LOG_PREFIX, 'Backend pivot rendered:', name, data.length, 'rows', 'total:', total);
-          renderPivot(data, total, grandTotals);
+          renderPivot(data, total, grandTotals, subtotals);
           }, vPage, vPageSize);
         }
         tryBackendPivot();
