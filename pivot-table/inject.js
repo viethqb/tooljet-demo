@@ -373,8 +373,35 @@
     cfg.aggregator = cfg.measures[0].aggregator;
     // Sort state — { key, direction } or null. key: "row:N" | "col:<colValue>:<measureIdx>" | "rowTotal:<measureIdx>"
     if (cfg.sort && (!cfg.sort.key || !cfg.sort.direction)) cfg.sort = null;
-    // Conditional formats — default empty array
+    // Invalidate sort if it references a measure index out of range
+    if (cfg.sort && cfg.sort.key) {
+      var sk = String(cfg.sort.key);
+      var measCount = cfg.measures.length;
+      var rowFieldsCount = (cfg.rowFields || []).length;
+      var _mi = -1;
+      if (sk.indexOf('rowTotal:') === 0) _mi = parseInt(sk.slice('rowTotal:'.length), 10);
+      else if (sk.indexOf('col:') === 0) {
+        var _sep = sk.lastIndexOf('|');
+        if (_sep > 0) _mi = parseInt(sk.slice(_sep + 1), 10);
+      }
+      if (!isNaN(_mi) && _mi >= 0 && _mi >= measCount) cfg.sort = null;
+      if (sk.indexOf('row:') === 0) {
+        var _ri = parseInt(sk.slice(4), 10);
+        if (isNaN(_ri) || _ri < 0 || _ri >= rowFieldsCount) cfg.sort = null;
+      }
+    }
+    // Conditional formats — default empty array; filter invalid rules
     if (!Array.isArray(cfg.conditionalFormats)) cfg.conditionalFormats = [];
+    cfg.conditionalFormats = cfg.conditionalFormats.filter(function (cf) {
+      if (!cf || typeof cf !== 'object') return false;
+      if (cf.measureId && cf.measureId !== 'all') {
+        // Drop CF rules that reference measures no longer present
+        var found = false;
+        for (var mi = 0; mi < cfg.measures.length; mi++) { if (cfg.measures[mi].id === cf.measureId) { found = true; break; } }
+        if (!found) return false;
+      }
+      return true;
+    });
     for (var ci = 0; ci < cfg.conditionalFormats.length; ci++) {
       var cf = cfg.conditionalFormats[ci];
       if (!cf.id) cf.id = 'cf_' + Math.random().toString(36).slice(2, 10);
@@ -788,13 +815,12 @@
     }
 
     // Fallback: temporarily show dataArea, extract, then re-hide
+    // (Returns empty result; caller must use extractDataAsync for the real data.)
     var dataArea = tableEl.querySelector('.jet-data-table');
     if (dataArea && dataArea.style.display === 'none') {
       dataArea.style.display = '';
-      // Force a layout reflow so virtualizer recalculates
       void dataArea.offsetHeight;
-      // Wait a frame for virtual rows to render
-      return { columns: result.columns, data: [], _pending: true, _name: name };
+      return { columns: result.columns, data: [] };
     }
 
     return result;
@@ -929,6 +955,38 @@
       '<div class="pivot-toolbar">' +
       '<button class="pivot-download-btn" data-format="excel" title="Download Excel">' + dlIcon + ' Excel</button>' +
       '</div></div>';
+  }
+
+  // Error boundary: render error state with retry button (button class picked up by caller to bind)
+  function buildErrorHTML(message, opts) {
+    opts = opts || {};
+    var showRetry = opts.retry !== false;
+    var kind = opts.kind || 'error';
+    var iconMap = {
+      error: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
+      warning: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+      empty: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>',
+    };
+    var icon = iconMap[kind] || iconMap.error;
+    return '<div class="pivot-error-state pivot-error-' + kind + '">' +
+      '<div class="pivot-error-icon">' + icon + '</div>' +
+      '<div class="pivot-error-msg">' + esc(message) + '</div>' +
+      (showRetry ? '<button type="button" class="pivot-retry-btn">Retry</button>' : '') +
+      '</div>';
+  }
+
+  // Render error in overlay + wire retry button
+  function showErrorInOverlay(overlayEl, config, message, retryFn, kind) {
+    overlayEl.innerHTML = buildTitleHTML(config) + buildErrorHTML(message, { kind: kind || 'error', retry: !!retryFn });
+    if (retryFn) {
+      var btn = overlayEl.querySelector('.pivot-retry-btn');
+      if (btn) btn.addEventListener('click', function (e) { e.stopPropagation(); retryFn(); });
+    }
+  }
+
+  // Build loading HTML (consistent across all call sites)
+  function buildLoadingHTML(msg) {
+    return '<div class="pivot-loading"><span class="pivot-spinner"></span><span>' + esc(msg || 'Loading...') + '</span></div>';
   }
 
   // ===================== DOWNLOAD =====================
@@ -1247,10 +1305,14 @@
 
         // Re-render
         setPivotPage(componentName, 0);
+        var self = this;
         if (config.backendPivot && (config.pageSize || 0) > 0) {
-          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty"><span class="pivot-spinner"></span> Sorting...</div>';
+          overlayEl.innerHTML = buildTitleHTML(config) + buildLoadingHTML('Sorting...');
           executePivotAsync(componentName, config, function (err, rows, total, grandTotals, subtotals) {
-            if (err) { overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>'; return; }
+            if (err) {
+              showErrorInOverlay(overlayEl, config, err.message || 'Sort failed', function () { self.click ? self.click() : null; });
+              return;
+            }
             var pData = reshapeBackendRows(rows, config);
             pData._isBackend = true;
             overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals, subtotals);
@@ -1287,10 +1349,11 @@
 
         if (config.backendPivot && pageSize > 0) {
           // Backend paging: re-fetch from API with new page
-          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty"><span class="pivot-spinner"></span> Loading page ' + (page + 1) + '...</div>';
+          var clickedBtn = this;
+          overlayEl.innerHTML = buildTitleHTML(config) + buildLoadingHTML('Loading page ' + (page + 1) + '...');
           executePivotAsync(componentName, config, function (err, rows, total, grandTotals, subtotals) {
             if (err) {
-              overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>';
+              showErrorInOverlay(overlayEl, config, err.message || ('Failed to load page ' + (page + 1)), function () { clickedBtn.click && clickedBtn.click(); });
               return;
             }
             var pData = reshapeBackendRows(rows, config);
@@ -1514,6 +1577,7 @@
     function _hexToRgb(hex) {
       var h = String(hex || '').replace('#', '');
       if (h.length === 3) h = h.split('').map(function (c) { return c + c; }).join('');
+      if (!/^[0-9a-fA-F]{6}$/.test(h)) return { r: 255, g: 255, b: 255 }; // fallback white for invalid hex
       var n = parseInt(h, 16);
       return { r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff };
     }
@@ -1698,20 +1762,24 @@
       if (!sortKey) return 0;
       if (sortKey.indexOf('row:') === 0) {
         var idx = parseInt(sortKey.slice(4), 10);
+        if (isNaN(idx) || idx < 0 || idx >= (rowFields || []).length) return 0;
         var parts = rowFieldValues[rk] || [];
         return parts[idx] !== undefined ? parts[idx] : '';
       }
       if (sortKey.indexOf('col:') === 0) {
         var rest = sortKey.slice(4);
         var sep = rest.lastIndexOf('|');
+        if (sep < 0) return 0;
         var cv = rest.slice(0, sep);
         var mi = parseInt(rest.slice(sep + 1), 10);
+        if (isNaN(mi) || mi < 0 || mi >= measures.length) return 0;
         var rd = tree[rk]; if (!rd) return 0;
         var cs = rd.cells[cv] || [];
         return parseFloat(computeCell(cs, cs.map(function (c) { return c.row; }), measures[mi], rk, cv)) || 0;
       }
       if (sortKey.indexOf('rowTotal:') === 0) {
         var mi2 = parseInt(sortKey.slice('rowTotal:'.length), 10);
+        if (isNaN(mi2) || mi2 < 0 || mi2 >= measures.length) return 0;
         var rd2 = tree[rk]; if (!rd2) return 0;
         return parseFloat(computeCell(rd2.values || [], rd2.rows || [], measures[mi2], rk, null)) || 0;
       }
@@ -1771,7 +1839,11 @@
     }
 
     function sortAttr(key) {
-      return ' data-sort-key="' + esc(key) + '"' + (sortKey === key && sortDir ? ' data-sort-dir="' + sortDir + '"' : '');
+      var tip;
+      if (sortKey !== key || !sortDir) tip = 'Click to sort descending';
+      else if (sortDir === 'desc') tip = 'Sorted descending — click to sort ascending';
+      else tip = 'Sorted ascending — click to clear sort';
+      return ' data-sort-key="' + esc(key) + '"' + (sortKey === key && sortDir ? ' data-sort-dir="' + sortDir + '"' : '') + ' title="' + esc(tip) + '"';
     }
     function sortIndicator(key) {
       if (sortKey !== key || !sortDir) return '<span class="pivot-sort-ind">⇅</span>';
@@ -3496,7 +3568,7 @@
           adjustPivotHeight(tableEl, ov);
         };
 
-        var showOverlayMsg = function (msg, isError) {
+        var showOverlayMsg = function (msg, isError, isLoading) {
           var ov = tableEl.querySelector('.pivot-overlay');
           var da = tableEl.querySelector('.jet-data-table');
           if (!ov) {
@@ -3507,12 +3579,14 @@
           }
           if (da) da.style.display = 'none';
           ov.style.display = 'flex';
-          ov.innerHTML = '<div class="pivot-empty"' + (isError ? ' style="color:#e5484d"' : '') + '>' + esc(msg) + '</div>';
+          if (isError) ov.innerHTML = buildTitleHTML(config) + buildErrorHTML(msg, { retry: false });
+          else if (isLoading) ov.innerHTML = buildTitleHTML(config) + buildLoadingHTML(msg);
+          else ov.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty">' + esc(msg) + '</div>';
         };
 
         if (config.backendPivot) {
           // Backend pivot: call server API directly (no need for query to run on frontend)
-          showOverlayMsg('<span class="pivot-spinner"></span> <span class="pivot-spinner"></span> Loading...');
+          showOverlayMsg('Loading...', false, true);
           var bpPageSize = config.pageSize || 0;
           var bpPage = bpPageSize > 0 ? getPivotPage(widgetName) : 0;
           executePivotAsync(widgetName, config, function (err, rows, total, grandTotals, subtotals) {
@@ -3736,16 +3810,20 @@
             var kPageSize = config.pageSize || 0;
             var kPage = kPageSize > 0 ? getPivotPage(name) : 0;
             // Use cache if available (avoid repeated API calls / retry loops)
-            if (_backendPivotCache[name]) {
-              if (_backendPivotCache[name].failed) return; // failed before, don't retry (use frontend fallback)
-              if (_backendPivotCache[name].data && !kPageSize) {
+            // Cache is valid if timestamp is within CACHE_TTL (else fetch fresh)
+            var cacheEntry = _backendPivotCache[name];
+            var cacheFresh = cacheEntry && cacheEntry.timestamp && (Date.now() - cacheEntry.timestamp < CACHE_TTL);
+            if (cacheEntry && !cacheFresh) { delete _backendPivotCache[name]; cacheEntry = null; }
+            if (cacheEntry) {
+              if (cacheEntry.failed) return; // failed before, don't retry (use frontend fallback)
+              if (cacheEntry.data && !kPageSize) {
                 var ov = ensureOverlay();
-                ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(_backendPivotCache[name].data, config, name);
-                ov._pivotData = _backendPivotCache[name].data;
+                ov.innerHTML = buildTitleHTML(config) + renderPivotHTML(cacheEntry.data, config, name);
+                ov._pivotData = cacheEntry.data;
                 bindDownloadButtons(ov, name);
-                bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
-                bindCollapseToggles(ov, name, _backendPivotCache[name].data, config, tableEl);
-                bindSortHeaders(ov, name, _backendPivotCache[name].data, config, tableEl);
+                bindPaginationButtons(ov, name, cacheEntry.data, config, tableEl);
+                bindCollapseToggles(ov, name, cacheEntry.data, config, tableEl);
+                bindSortHeaders(ov, name, cacheEntry.data, config, tableEl);
                 return;
               }
             }
@@ -3887,12 +3965,12 @@
           else tableEl.appendChild(overlay);
         }
         overlay.style.display = 'flex';
-        overlay.innerHTML = '<div class="pivot-empty"><span class="pivot-spinner"></span> Loading...</div>';
+        overlay.innerHTML = buildTitleHTML(config) + buildLoadingHTML('Loading...');
       }
 
-      function showError(msg) {
+      function showError(msg, retryFn) {
         var overlay = tableEl.querySelector('.pivot-overlay');
-        if (overlay) overlay.innerHTML = '<div class="pivot-empty" style="color:#e5484d">' + esc(msg) + '</div>';
+        if (overlay) showErrorInOverlay(overlay, config, msg, retryFn);
       }
 
       // ---- Backend Pivot: call server API directly ----

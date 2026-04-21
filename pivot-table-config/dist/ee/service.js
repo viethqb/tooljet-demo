@@ -558,7 +558,7 @@ let PivotTableConfigService = class PivotTableConfigService {
         if (page !== null && page !== undefined) {
             page = parseInt(page, 10);
             if (isNaN(page) || page < 0) page = 0;
-            if (page > 100000) page = 100000; // upper bound safety
+            if (page > 10000) page = 10000; // upper bound safety (prevents scan of hundreds of millions of rows)
         }
 
         // Normalize (ensures measures[] exists)
@@ -572,8 +572,9 @@ let PivotTableConfigService = class PivotTableConfigService {
         }
         pivotConfig.aggregator = pivotConfig.measures[0].aggregator;
 
-        // Validate fields: must be non-empty strings, no special chars beyond alphanumeric/underscore/space/dot
-        var fieldPattern = /^[\w\s.\-\u00C0-\u024F\u1E00-\u1EFF]+$/;
+        // Validate fields: must be non-empty strings, no special chars beyond alphanumeric/underscore/space/dot.
+        // Note: \s excluded to prevent newline/tab-based injection attempts; only literal space allowed inline.
+        var fieldPattern = /^[\w .\-\u00C0-\u024F\u1E00-\u1EFF]+$/;
         var allFields = (pivotConfig.rowFields || []).concat(pivotConfig.colFields || []);
         for (var mf = 0; mf < pivotConfig.measures.length; mf++) {
             var mMm = pivotConfig.measures[mf];

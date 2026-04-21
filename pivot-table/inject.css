@@ -381,6 +381,56 @@
   to { transform: rotate(360deg); }
 }
 
+.pivot-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 100%;
+  min-height: 100px;
+  color: var(--slate9, #889096);
+  font-size: 13px;
+  padding: 24px;
+}
+
+/* Error boundary */
+.pivot-error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 160px;
+  padding: 24px;
+  text-align: center;
+}
+.pivot-error-icon {
+  color: var(--red9, #dc2626);
+  opacity: 0.8;
+}
+.pivot-error-warning .pivot-error-icon { color: var(--amber9, #f59e0b); }
+.pivot-error-empty .pivot-error-icon { color: var(--slate9, #889096); }
+.pivot-error-msg {
+  color: var(--slate12, #0f172a);
+  font-size: 13px;
+  max-width: 420px;
+  word-wrap: break-word;
+  line-height: 1.5;
+}
+.pivot-retry-btn {
+  background: var(--indigo9, #3e63dd);
+  color: white;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 16px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+}
+.pivot-retry-btn:hover { background: var(--indigo10, #3358d4); }
+.pivot-retry-btn:active { transform: translateY(1px); }
+.dark-theme .pivot-error-msg { color: var(--slate2, #e5e7eb); }
+
 /* =====================================================================
    PIVOT TABLE RESULT
    ===================================================================== */
