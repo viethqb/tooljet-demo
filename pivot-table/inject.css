@@ -440,6 +440,20 @@
   background: rgba(62, 99, 221, 0.06) !important;
 }
 
+/* Sortable headers */
+.pivot-sortable { cursor: pointer; user-select: none; }
+.pivot-sortable:hover { background: rgba(62, 99, 221, 0.08) !important; }
+.pivot-sort-ind {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 10px;
+  color: transparent;
+  transition: color 0.15s;
+}
+.pivot-sortable:hover .pivot-sort-ind { color: var(--slate9, #889096); }
+.pivot-sortable .pivot-sort-ind.pivot-sort-active { color: var(--indigo9, #3e63dd); }
+.pivot-sortable .pivot-sort-ind.pivot-sort-active::before { content: ''; }
+
 /* Section label in Inspector */
 .pivot-section-label {
   font-size: 10px;

@@ -371,6 +371,8 @@
     // Mirror first measure to legacy fields for backward-compat with old clients
     cfg.valueField = cfg.measures[0].field;
     cfg.aggregator = cfg.measures[0].aggregator;
+    // Sort state — { key, direction } or null. key: "row:N" | "col:<colValue>:<measureIdx>" | "rowTotal:<measureIdx>"
+    if (cfg.sort && (!cfg.sort.key || !cfg.sort.direction)) cfg.sort = null;
     // Conditional formats — default empty array
     if (!Array.isArray(cfg.conditionalFormats)) cfg.conditionalFormats = [];
     for (var ci = 0; ci < cfg.conditionalFormats.length; ci++) {
@@ -1220,6 +1222,55 @@
   // Collapse/expand feature removed
   function bindCollapseToggles() { /* no-op */ }
 
+  // Bind sort headers — click cycles desc → asc → none, re-renders pivot
+  function bindSortHeaders(overlayEl, componentName, data, config, tableEl, serverTotal) {
+    var ths = overlayEl.querySelectorAll('th.pivot-sortable');
+    for (var i = 0; i < ths.length; i++) {
+      ths[i].addEventListener('click', function (e) {
+        e.stopPropagation();
+        var key = this.getAttribute('data-sort-key');
+        if (!key) return;
+        var curKey = config.sort && config.sort.key;
+        var curDir = config.sort && config.sort.direction;
+        var newDir;
+        if (curKey !== key) newDir = 'desc';
+        else if (curDir === 'desc') newDir = 'asc';
+        else newDir = null;
+        config.sort = newDir ? { key: key, direction: newDir } : null;
+
+        // Persist to config cache so editor + future loads see it
+        try {
+          if (typeof setConfig === 'function') setConfig(componentName, config);
+          if (typeof configCache !== 'undefined' && configCache[componentName]) configCache[componentName].sort = config.sort;
+          if (typeof viewerConfigs !== 'undefined' && viewerConfigs[componentName]) viewerConfigs[componentName].sort = config.sort;
+        } catch (_) {}
+
+        // Re-render
+        setPivotPage(componentName, 0);
+        if (config.backendPivot && (config.pageSize || 0) > 0) {
+          overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty"><span class="pivot-spinner"></span> Sorting...</div>';
+          executePivotAsync(componentName, config, function (err, rows, total, grandTotals, subtotals) {
+            if (err) { overlayEl.innerHTML = buildTitleHTML(config) + '<div class="pivot-empty" style="color:#e5484d">' + esc(err.message) + '</div>'; return; }
+            var pData = reshapeBackendRows(rows, config);
+            pData._isBackend = true;
+            overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(pData, config, componentName, total, grandTotals, subtotals);
+            overlayEl._pivotData = pData; overlayEl._pivotServerTotal = total; overlayEl._pivotServerGrandTotals = grandTotals;
+            bindDownloadButtons(overlayEl, componentName);
+            bindPaginationButtons(overlayEl, componentName, pData, config, tableEl, total);
+            bindSortHeaders(overlayEl, componentName, pData, config, tableEl, total);
+            if (tableEl) adjustPivotHeight(tableEl, overlayEl);
+          }, 0, config.pageSize || 0);
+        } else {
+          overlayEl.innerHTML = buildTitleHTML(config) + renderPivotHTML(data, config, componentName, serverTotal, overlayEl._pivotServerGrandTotals, overlayEl._pivotServerSubtotals);
+          bindDownloadButtons(overlayEl, componentName);
+          bindPaginationButtons(overlayEl, componentName, data, config, tableEl, serverTotal);
+          bindSortHeaders(overlayEl, componentName, data, config, tableEl, serverTotal);
+          if (tableEl) adjustPivotHeight(tableEl, overlayEl);
+        }
+      });
+    }
+  }
+
   // Bind pagination buttons — re-renders pivot on page change
   // serverTotal: if not null, use backend pagination (re-fetch from API)
   function bindPaginationButtons(overlayEl, componentName, data, config, tableEl, serverTotal) {
@@ -1249,6 +1300,7 @@
             bindDownloadButtons(overlayEl, componentName);
             bindPaginationButtons(overlayEl, componentName, pData, config, tableEl, total);
             bindCollapseToggles(overlayEl, componentName, pData, config, tableEl, total, grandTotals);
+            bindSortHeaders(overlayEl, componentName, pData, config, tableEl, total);
             if (tableEl) adjustPivotHeight(tableEl, overlayEl);
             var scroll = overlayEl.querySelector('.pivot-result-scroll');
             if (scroll) scroll.scrollTop = 0;
@@ -1260,6 +1312,7 @@
           bindDownloadButtons(overlayEl, componentName);
           bindPaginationButtons(overlayEl, componentName, data, config, tableEl);
           bindCollapseToggles(overlayEl, componentName, data, config, tableEl);
+          bindSortHeaders(overlayEl, componentName, data, config, tableEl);
           if (tableEl) adjustPivotHeight(tableEl, overlayEl);
           var scroll = overlayEl.querySelector('.pivot-result-scroll');
           if (scroll) scroll.scrollTop = 0;
@@ -1638,6 +1691,93 @@
       return '<td class="pivot-cell' + (extraClass ? ' ' + extraClass : '') + '"' + sf(align, style, cfCss) + '>' + text + '</td>';
     }
 
+    // ===================== SORT =====================
+    var sortKey = (config.sort && config.sort.key) || null;
+    var sortDir = (config.sort && config.sort.direction) || null;
+    function rowSortVal(rk) {
+      if (!sortKey) return 0;
+      if (sortKey.indexOf('row:') === 0) {
+        var idx = parseInt(sortKey.slice(4), 10);
+        var parts = rowFieldValues[rk] || [];
+        return parts[idx] !== undefined ? parts[idx] : '';
+      }
+      if (sortKey.indexOf('col:') === 0) {
+        var rest = sortKey.slice(4);
+        var sep = rest.lastIndexOf('|');
+        var cv = rest.slice(0, sep);
+        var mi = parseInt(rest.slice(sep + 1), 10);
+        var rd = tree[rk]; if (!rd) return 0;
+        var cs = rd.cells[cv] || [];
+        return parseFloat(computeCell(cs, cs.map(function (c) { return c.row; }), measures[mi], rk, cv)) || 0;
+      }
+      if (sortKey.indexOf('rowTotal:') === 0) {
+        var mi2 = parseInt(sortKey.slice('rowTotal:'.length), 10);
+        var rd2 = tree[rk]; if (!rd2) return 0;
+        return parseFloat(computeCell(rd2.values || [], rd2.rows || [], measures[mi2], rk, null)) || 0;
+      }
+      return 0;
+    }
+    function cmpSort(a, b) {
+      var sign = sortDir === 'desc' ? -1 : 1;
+      if (typeof a === 'string' && typeof b === 'string') return sign * a.localeCompare(b);
+      var na = parseFloat(a), nb = parseFloat(b);
+      if (isNaN(na)) na = typeof a === 'number' ? a : -Infinity;
+      if (isNaN(nb)) nb = typeof b === 'number' ? b : -Infinity;
+      return sign * (na - nb);
+    }
+    var _rowSortCache = {};
+    if (sortKey && sortDir) {
+      for (var _rki = 0; _rki < rowKeys.length; _rki++) {
+        _rowSortCache[rowKeys[_rki]] = rowSortVal(rowKeys[_rki]);
+      }
+      rowKeys = rowKeys.slice().sort(function (a, b) {
+        return cmpSort(_rowSortCache[a], _rowSortCache[b]);
+      });
+    }
+    // Recursive: sort group tree node.order by aggregate of descendants
+    function sortTreeNode(node, depth) {
+      if (!sortKey || !sortDir || !node.order || !node.order.length) return;
+      var aggMap = {};
+      for (var oi = 0; oi < node.order.length; oi++) {
+        var gVal = node.order[oi];
+        var child = node.children[gVal];
+        if (!child) continue;
+        var agg;
+        if (sortKey.indexOf('row:') === 0) {
+          var lvl = parseInt(sortKey.slice(4), 10);
+          if (lvl === depth) {
+            agg = gVal;
+          } else {
+            agg = child.keys.length ? _rowSortCache[child.keys[0]] : '';
+          }
+        } else {
+          // col:/rowTotal: → sum of descendant leaf values
+          var s = 0;
+          for (var ki = 0; ki < child.keys.length; ki++) {
+            var v = parseFloat(_rowSortCache[child.keys[ki]]);
+            if (!isNaN(v)) s += v;
+          }
+          agg = s;
+        }
+        aggMap[gVal] = agg;
+      }
+      node.order.sort(function (a, b) { return cmpSort(aggMap[a], aggMap[b]); });
+      for (var oi2 = 0; oi2 < node.order.length; oi2++) {
+        sortTreeNode(node.children[node.order[oi2]], depth + 1);
+      }
+      if (node.keys && node.keys.length) {
+        node.keys.sort(function (a, b) { return cmpSort(_rowSortCache[a], _rowSortCache[b]); });
+      }
+    }
+
+    function sortAttr(key) {
+      return ' data-sort-key="' + esc(key) + '"' + (sortKey === key && sortDir ? ' data-sort-dir="' + sortDir + '"' : '');
+    }
+    function sortIndicator(key) {
+      if (sortKey !== key || !sortDir) return '<span class="pivot-sort-ind">⇅</span>';
+      return '<span class="pivot-sort-ind pivot-sort-active">' + (sortDir === 'asc' ? '▲' : '▼') + '</span>';
+    }
+
     var h = '<div class="pivot-result-scroll"><table class="pivot-table"><thead>';
 
     // Total number of header rows: col fields levels + (1 if multi-measure)
@@ -1652,8 +1792,9 @@
 
         if (level === 0) {
           for (var rf = 0; rf < (rowFields.length || 1); rf++) {
-            h += '<th class="pivot-row-header" rowspan="' + headerRowCount + '">' +
-              esc(rowFields.length > 0 ? rowFields[rf] : 'Row') + '</th>';
+            var rfKey = 'row:' + rf;
+            h += '<th class="pivot-row-header pivot-sortable" rowspan="' + headerRowCount + '"' + sortAttr(rfKey) + '>' +
+              esc(rowFields.length > 0 ? rowFields[rf] : 'Row') + sortIndicator(rfKey) + '</th>';
           }
         }
 
@@ -1682,12 +1823,16 @@
             }
           } else {
             // Leaf level: one header per colValue, spanning numMeasures if multi-measure
-            h += '<th class="pivot-col-header"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(parts[level]) + '</th>';
+            // In single-measure mode, header itself is the sort target (col:cv|0)
+            var cvLeaf = colValues[ci];
+            var leafKey = !isMulti ? 'col:' + cvLeaf + '|0' : '';
+            h += '<th class="pivot-col-header' + (!isMulti ? ' pivot-sortable' : '') + '"' + (isMulti ? ' colspan="' + numMeasures + '"' : sortAttr(leafKey)) + '>' + esc(parts[level]) + (!isMulti ? sortIndicator(leafKey) : '') + '</th>';
           }
         }
 
         if (level === 0 && showRowTotal) {
-          h += '<th class="pivot-total-header" rowspan="' + headerRowCount + '"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(rowTotalLabel) + '</th>';
+          var rtKey0 = !isMulti ? 'rowTotal:0' : '';
+          h += '<th class="pivot-total-header' + (!isMulti ? ' pivot-sortable' : '') + '" rowspan="' + headerRowCount + '"' + (isMulti ? ' colspan="' + numMeasures + '"' : sortAttr(rtKey0)) + '>' + esc(rowTotalLabel) + (!isMulti ? sortIndicator(rtKey0) : '') + '</th>';
         }
         h += '</tr>';
       }
@@ -1696,10 +1841,10 @@
         h += '<tr>';
         for (var ci_m = 0; ci_m < colValues.length; ci_m++) {
           for (var mmi = 0; mmi < numMeasures; mmi++) {
-            h += '<th class="pivot-measure-header">' + esc(measureLabel(measures[mmi])) + '</th>';
+            var mk = 'col:' + colValues[ci_m] + '|' + mmi;
+            h += '<th class="pivot-measure-header pivot-sortable"' + sortAttr(mk) + '>' + esc(measureLabel(measures[mmi])) + sortIndicator(mk) + '</th>';
           }
         }
-        // row total: also one cell per measure (rowspan handled above; this row has measure labels under row-total header)
         h += '</tr>';
       }
 
@@ -1711,29 +1856,38 @@
       h += '<tr>';
       if (rowFields.length > 0) {
         for (var rf2 = 0; rf2 < rowFields.length; rf2++) {
-          h += '<th class="pivot-row-header"' + (needsMeasureRow ? ' rowspan="2"' : '') + '>' + esc(rowFields[rf2]) + '</th>';
+          var rfKey2 = 'row:' + rf2;
+          h += '<th class="pivot-row-header pivot-sortable"' + (needsMeasureRow ? ' rowspan="2"' : '') + sortAttr(rfKey2) + '>' + esc(rowFields[rf2]) + sortIndicator(rfKey2) + '</th>';
         }
       } else {
         h += '<th class="pivot-row-header"' + (needsMeasureRow ? ' rowspan="2"' : '') + '>Row</th>';
       }
       if (showCols) {
         for (var ci2 = 0; ci2 < colValues.length; ci2++) {
-          h += '<th class="pivot-col-header"' + (isMulti ? ' colspan="' + numMeasures + '"' : '') + '>' + esc(colParts(colValues[ci2]).join(' / ')) + '</th>';
+          var cvS = colValues[ci2];
+          var singleKey = !isMulti ? 'col:' + cvS + '|0' : '';
+          h += '<th class="pivot-col-header' + (!isMulti ? ' pivot-sortable' : '') + '"' + (isMulti ? ' colspan="' + numMeasures + '"' : sortAttr(singleKey)) + '>' + esc(colParts(cvS).join(' / ')) + (!isMulti ? sortIndicator(singleKey) : '') + '</th>';
         }
       } else if (noColMeasures) {
-        // Measure labels directly in header row 1 (single or multi-measure)
+        // Measure labels directly in header row 1 (single or multi-measure) — each is a data column
+        // Sort key: rowTotal:M (since no col grouping, measure column = row total)
         for (var mh = 0; mh < numMeasures; mh++) {
-          h += '<th class="pivot-col-header">' + esc(measureLabel(measures[mh])) + '</th>';
+          var mhKey = 'rowTotal:' + mh;
+          h += '<th class="pivot-col-header pivot-sortable"' + sortAttr(mhKey) + '>' + esc(measureLabel(measures[mh])) + sortIndicator(mhKey) + '</th>';
         }
       }
-      if (showRowTotal) h += '<th class="pivot-total-header"' + (needsMeasureRow ? ' rowspan="2" colspan="' + numMeasures + '"' : '') + '>' + esc(rowTotalLabel) + '</th>';
+      if (showRowTotal) {
+        var rtKey1 = !isMulti ? 'rowTotal:0' : '';
+        h += '<th class="pivot-total-header' + (!isMulti ? ' pivot-sortable' : '') + '"' + (needsMeasureRow ? ' rowspan="2" colspan="' + numMeasures + '"' : sortAttr(rtKey1)) + '>' + esc(rowTotalLabel) + (!isMulti ? sortIndicator(rtKey1) : '') + '</th>';
+      }
       h += '</tr>';
       // Multi-measure with col fields: add second row with measure labels under each col value
       if (needsMeasureRow) {
         h += '<tr>';
         for (var ch = 0; ch < colValues.length; ch++) {
           for (var mmi2 = 0; mmi2 < numMeasures; mmi2++) {
-            h += '<th class="pivot-measure-header">' + esc(measureLabel(measures[mmi2])) + '</th>';
+            var mk2 = 'col:' + colValues[ch] + '|' + mmi2;
+            h += '<th class="pivot-measure-header pivot-sortable"' + sortAttr(mk2) + '>' + esc(measureLabel(measures[mmi2])) + sortIndicator(mk2) + '</th>';
           }
         }
         h += '</tr>';
@@ -1970,6 +2124,7 @@
     // Render data rows; if showSubtotal, insert "{group} Subtotal" row after each first-level group
     if (showSubtotal) {
       var groupTree = buildGroupTree(pageRowKeys);
+      sortTreeNode(groupTree, 0);
       function renderGroup(node, depth) {
         if (depth >= rowFields.length - 1 || !node.order || !node.order.length) {
           for (var li = 0; li < node.keys.length; li++) {
@@ -3337,6 +3492,7 @@
           bindDownloadButtons(ov, widgetName);
           bindPaginationButtons(ov, widgetName, data, config, tableEl, serverTotal);
           bindCollapseToggles(ov, widgetName, data, config, tableEl, serverTotal, serverGrandTotals);
+          bindSortHeaders(ov, widgetName, data, config, tableEl, serverTotal);
           adjustPivotHeight(tableEl, ov);
         };
 
@@ -3589,6 +3745,7 @@
                 bindDownloadButtons(ov, name);
                 bindPaginationButtons(ov, name, _backendPivotCache[name].data, config, tableEl);
                 bindCollapseToggles(ov, name, _backendPivotCache[name].data, config, tableEl);
+                bindSortHeaders(ov, name, _backendPivotCache[name].data, config, tableEl);
                 return;
               }
             }
@@ -3608,6 +3765,7 @@
                   ov2.innerHTML = buildTitleHTML(config) + renderPivotHTML(extracted.data, config, name);
                   bindDownloadButtons(ov2, name);
                   bindPaginationButtons(ov2, name, extracted.data, config, tableEl);
+                  bindSortHeaders(ov2, name, extracted.data, config, tableEl);
                 });
                 return;
               }
@@ -3620,6 +3778,7 @@
               bindDownloadButtons(ov, name);
               bindPaginationButtons(ov, name, data, config, tableEl, total);
               bindCollapseToggles(ov, name, data, config, tableEl, total, grandTotals);
+              bindSortHeaders(ov, name, data, config, tableEl, total);
             }, kPage, kPageSize);
           } else {
             // Frontend pivot: extract from DOM
@@ -3631,6 +3790,7 @@
               bindDownloadButtons(ov, name);
               bindPaginationButtons(ov, name, extracted.data, config, tableEl);
               bindCollapseToggles(ov, name, extracted.data, config, tableEl);
+              bindSortHeaders(ov, name, extracted.data, config, tableEl);
             });
           }
         })(tables[i]);
@@ -3712,6 +3872,7 @@
         bindDownloadButtons(overlay, name);
         bindPaginationButtons(overlay, name, data, config, tableEl, serverTotal);
         bindCollapseToggles(overlay, name, data, config, tableEl, serverTotal, serverGrandTotals);
+        bindSortHeaders(overlay, name, data, config, tableEl, serverTotal);
         adjustPivotHeight(tableEl, overlay);
       }
 
