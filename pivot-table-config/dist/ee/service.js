@@ -934,28 +934,92 @@ let PivotTableConfigService = class PivotTableConfigService {
             baseSql = 'SELECT ' + outerParts.join(', ') + ' FROM (\n' + baseSql + '\n) AS ' + alias('_pivot_cum');
         }
 
+        // ---- SORT: parse user-requested sort (optional) ----
+        // Supported: row:N (sort by rowField[N]), rowTotal:mi (sort by sum of measure across cols per rowKey)
+        // Unsupported in backend (falls back to frontend page-level sort): col:cv|mi
+        var sortSpec = null;
+        if (config.sort && config.sort.key && config.sort.direction) {
+            var sDir = String(config.sort.direction).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+            var sKey = String(config.sort.key);
+            if (sKey.indexOf('row:') === 0) {
+                var sIdx = parseInt(sKey.slice(4), 10);
+                if (!isNaN(sIdx) && sIdx >= 0 && sIdx < rowFields.length) {
+                    sortSpec = { type: 'row', field: rowFields[sIdx], dir: sDir };
+                }
+            } else if (sKey.indexOf('rowTotal:') === 0) {
+                var sMi = parseInt(sKey.slice('rowTotal:'.length), 10);
+                if (!isNaN(sMi) && sMi >= 0 && sMi < measures.length) {
+                    sortSpec = { type: 'rowTotal', measureIdx: sMi, dir: sDir };
+                }
+            }
+        }
+
+        // Compute sort expressions (for DENSE_RANK ORDER BY, plus final ORDER BY)
+        // For rowTotal sort, we wrap baseSql in an outer SELECT that adds `_sort_key` via window function
+        var sortKeyAlias = alias('_sort_key');
+        if (sortSpec && sortSpec.type === 'rowTotal') {
+            var partitionBy = rowGroupBy.length ? ('PARTITION BY ' + rowGroupBy.join(', ') + ' ') : '';
+            // SUM over grouped rows of _pivot_m_mi gives per-rowKey total across col dimensions
+            baseSql = 'SELECT *, SUM(' + alias('_pivot_m_' + sortSpec.measureIdx) + ') OVER (' + partitionBy + ') AS ' + sortKeyAlias + '\n' +
+                'FROM (\n' + baseSql + '\n) AS ' + alias('_pivot_sort_base');
+        }
+
+        // Build ORDER BY clauses (for DENSE_RANK inner + final)
+        function buildOrderBy(includeColForTiebreak) {
+            if (!sortSpec) {
+                return (includeColForTiebreak ? groupBy : rowGroupBy).join(', ');
+            }
+            var primary;
+            if (sortSpec.type === 'row') {
+                primary = esc(sortSpec.field) + ' ' + sortSpec.dir;
+            } else {
+                primary = sortKeyAlias + ' ' + sortSpec.dir;
+            }
+            // Tiebreakers: remaining rowFields (excluding primary sort field), then colFields if requested
+            var tiebreakParts = [];
+            for (var tri = 0; tri < rowFields.length; tri++) {
+                var rfEsc = esc(rowFields[tri]);
+                if (sortSpec.type === 'row' && rowFields[tri] === sortSpec.field) continue;
+                tiebreakParts.push(rfEsc);
+            }
+            if (includeColForTiebreak) {
+                for (var tci = 0; tci < colFields.length; tci++) tiebreakParts.push(esc(colFields[tci]));
+            }
+            return primary + (tiebreakParts.length ? ', ' + tiebreakParts.join(', ') : '');
+        }
+
         // Pagination: use DENSE_RANK on rowFields to keep all cells of one row key on same page
         if (pageSize && pageSize > 0 && rowFields.length > 0 && colFields.length > 0) {
-            var rankOrder = rowGroupBy.join(', ');
-            var rankedParts = selectParts.slice();
-            rankedParts.push('DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS ' + alias('_pivot_row_rank'));
+            var rankOrder = sortSpec
+                ? buildOrderBy(false) // rank by sort+rowField tiebreakers, NOT colFields (cells of same rowKey share rank)
+                : rowGroupBy.join(', ');
 
-            var rankedSql = 'SELECT ' + rankedParts.join(', ') + '\n' +
-                'FROM (\n' + cleanSql + '\n) AS ' + alias('_pivot_src') + '\n' +
-                'GROUP BY ' + groupBy.join(', ');
+            // When rowTotal sort, sort_key is already added to baseSql; use SELECT * to pick it up + add rank
+            // Otherwise build from inner grouped SELECT as before
+            var rankedSql;
+            if (sortSpec && sortSpec.type === 'rowTotal') {
+                rankedSql = 'SELECT *, DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS ' + alias('_pivot_row_rank') + '\n' +
+                    'FROM (\n' + baseSql + '\n) AS ' + alias('_pivot_ranked_base');
+            } else {
+                var rankedParts = selectParts.slice();
+                rankedParts.push('DENSE_RANK() OVER (ORDER BY ' + rankOrder + ') AS ' + alias('_pivot_row_rank'));
+                rankedSql = 'SELECT ' + rankedParts.join(', ') + '\n' +
+                    'FROM (\n' + cleanSql + '\n) AS ' + alias('_pivot_src') + '\n' +
+                    'GROUP BY ' + groupBy.join(', ');
+            }
 
             var offset = (page || 0) * pageSize;
             return 'SELECT * FROM (\n' + rankedSql + '\n) AS ' + alias('_pivot_page') + '\n' +
                 'WHERE ' + alias('_pivot_row_rank') + ' > ' + parseInt(offset, 10) +
                 ' AND ' + alias('_pivot_row_rank') + ' <= ' + parseInt(offset + pageSize, 10) + '\n' +
-                'ORDER BY ' + groupBy.join(', ');
+                'ORDER BY ' + buildOrderBy(true);
         } else if (pageSize && pageSize > 0) {
             var offset = (page || 0) * pageSize;
-            return baseSql + '\nORDER BY ' + groupBy.join(', ') +
+            return baseSql + '\nORDER BY ' + buildOrderBy(true) +
                 '\nLIMIT ' + parseInt(pageSize, 10) + ' OFFSET ' + parseInt(offset, 10);
         }
 
-        return baseSql + '\nORDER BY ' + groupBy.join(', ');
+        return baseSql + '\nORDER BY ' + buildOrderBy(true);
     }
 
     _buildPivotCountSql(originalSql, config, kind) {
