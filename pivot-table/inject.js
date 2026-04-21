@@ -371,6 +371,22 @@
     // Mirror first measure to legacy fields for backward-compat with old clients
     cfg.valueField = cfg.measures[0].field;
     cfg.aggregator = cfg.measures[0].aggregator;
+    // Conditional formats — default empty array
+    if (!Array.isArray(cfg.conditionalFormats)) cfg.conditionalFormats = [];
+    for (var ci = 0; ci < cfg.conditionalFormats.length; ci++) {
+      var cf = cfg.conditionalFormats[ci];
+      if (!cf.id) cf.id = 'cf_' + Math.random().toString(36).slice(2, 10);
+      if (!cf.type) cf.type = 'threshold';
+      if (!cf.measureId) cf.measureId = 'all';
+      if (cf.type === 'threshold') {
+        if (!cf.operator) cf.operator = '>';
+        if (!cf.bgColor) cf.bgColor = '#d4f4dd';
+      } else if (cf.type === 'gradient') {
+        if (!cf.minColor) cf.minColor = '#ffffff';
+        if (!cf.maxColor) cf.maxColor = '#22c55e';
+      }
+      if (typeof cf.applyToTotals !== 'boolean') cf.applyToTotals = false;
+    }
     return cfg;
   }
 
@@ -1427,13 +1443,107 @@
     // Back-compat fmtNum (no measure)
     function fmtNum(v) { return fmtVal(v, null); }
 
-    // Build inline style from alignment + text style string
-    function sf(align, style) {
+    // Build inline style from alignment + text style string (+ optional extra CSS, e.g. conditional formatting)
+    function sf(align, style, extraCss) {
       var css = 'text-align:' + align;
       css += ';font-weight:' + (style.indexOf('bold') !== -1 ? '600' : 'normal');
       css += ';font-style:' + (style.indexOf('italic') !== -1 ? 'italic' : 'normal');
       css += ';text-decoration:' + (style.indexOf('underline') !== -1 ? 'underline' : 'none');
+      if (extraCss) css += extraCss;
       return ' style="' + css + '"';
+    }
+
+    // ===================== CONDITIONAL FORMATTING =====================
+    var cfRules = Array.isArray(config.conditionalFormats) ? config.conditionalFormats : [];
+    // Per-gradient-rule stats: ruleId → { min, max }
+    // Computed lazily on first access via _computeGradientStats()
+    var _gradientStats = null;
+    function _hexToRgb(hex) {
+      var h = String(hex || '').replace('#', '');
+      if (h.length === 3) h = h.split('').map(function (c) { return c + c; }).join('');
+      var n = parseInt(h, 16);
+      return { r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff };
+    }
+    function _interpolateColor(c1, c2, t) {
+      var a = _hexToRgb(c1), b = _hexToRgb(c2);
+      t = Math.max(0, Math.min(1, t));
+      var r = Math.round(a.r + (b.r - a.r) * t);
+      var g = Math.round(a.g + (b.g - a.g) * t);
+      var bl = Math.round(a.b + (b.b - a.b) * t);
+      return 'rgb(' + r + ',' + g + ',' + bl + ')';
+    }
+    function _computeGradientStats() {
+      if (_gradientStats) return _gradientStats;
+      _gradientStats = {};
+      for (var ri = 0; ri < cfRules.length; ri++) {
+        var rule = cfRules[ri];
+        if (rule.type !== 'gradient') continue;
+        var mIdx = -1;
+        for (var mi = 0; mi < measures.length; mi++) { if (measures[mi].id === rule.measureId) { mIdx = mi; break; } }
+        if (mIdx < 0) continue;
+        var measure = measures[mIdx];
+        var minV = Infinity, maxV = -Infinity;
+        // Walk data cells only (exclude totals to avoid skewed range)
+        for (var rki = 0; rki < rowKeys.length; rki++) {
+          var rd = tree[rowKeys[rki]];
+          if (!rd) continue;
+          if (showCols) {
+            for (var cvi = 0; cvi < colValues.length; cvi++) {
+              var cs = rd.cells[colValues[cvi]] || [];
+              var rs = cs.map(function (c) { return c.row; });
+              var vv = computeCell(cs, rs, measure, rowKeys[rki], colValues[cvi]);
+              var nn = parseFloat(vv);
+              if (!isNaN(nn) && isFinite(nn)) { if (nn < minV) minV = nn; if (nn > maxV) maxV = nn; }
+            }
+          } else {
+            var vv2 = computeCell(rd.values || [], rd.rows || [], measure, rowKeys[rki], '(All)');
+            var nn2 = parseFloat(vv2);
+            if (!isNaN(nn2) && isFinite(nn2)) { if (nn2 < minV) minV = nn2; if (nn2 > maxV) maxV = nn2; }
+          }
+        }
+        _gradientStats[rule.id] = { min: isFinite(minV) ? minV : 0, max: isFinite(maxV) ? maxV : 0 };
+      }
+      return _gradientStats;
+    }
+    function _ruleMatchesMeasure(rule, measure) {
+      return rule.measureId === 'all' || rule.measureId === measure.id;
+    }
+    function _thresholdMatches(rule, n) {
+      if (isNaN(n)) return false;
+      var v1 = parseFloat(rule.value1), v2 = parseFloat(rule.value2);
+      switch (rule.operator) {
+        case '>': return n > v1;
+        case '<': return n < v1;
+        case '>=': return n >= v1;
+        case '<=': return n <= v1;
+        case '=': return n === v1;
+        case 'between': return n >= Math.min(v1, v2) && n <= Math.max(v1, v2);
+      }
+      return false;
+    }
+    function cfStyle(val, measure, isTotal) {
+      if (!cfRules.length || !measure) return '';
+      var n = parseFloat(val);
+      for (var i = 0; i < cfRules.length; i++) {
+        var rule = cfRules[i];
+        if (!_ruleMatchesMeasure(rule, measure)) continue;
+        if (isTotal && !rule.applyToTotals) continue;
+        if (rule.type === 'threshold') {
+          if (_thresholdMatches(rule, n)) {
+            var css = ';background-color:' + rule.bgColor;
+            if (rule.textColor) css += ';color:' + rule.textColor;
+            return css;
+          }
+        } else if (rule.type === 'gradient') {
+          if (isNaN(n)) continue;
+          var stats = _computeGradientStats()[rule.id];
+          if (!stats) continue;
+          var range = stats.max - stats.min;
+          var t = range > 0 ? (n - stats.min) / range : 0.5;
+          return ';background-color:' + _interpolateColor(rule.minColor, rule.maxColor, t);
+        }
+      }
+      return '';
     }
 
     // Split column key back to individual parts
@@ -1523,7 +1633,9 @@
     function renderCell(cells, rows, measure, align, style, extraClass, rk, ck) {
       var v = computeCell(cells || [], rows || [], measure, rk, ck);
       var text = (cells && cells.length) || measure.aggregator === 'count' || measure.aggregator === 'count-where' || measure.aggregator === 'expr' ? fmtVal(v, measure) : esc(emptyVal);
-      return '<td class="pivot-cell' + (extraClass ? ' ' + extraClass : '') + '"' + sf(align, style) + '>' + text + '</td>';
+      var isTotal = !!(extraClass && extraClass.indexOf('pivot-total-cell') !== -1);
+      var cfCss = cfStyle(v, measure, isTotal);
+      return '<td class="pivot-cell' + (extraClass ? ' ' + extraClass : '') + '"' + sf(align, style, cfCss) + '>' + text + '</td>';
     }
 
     var h = '<div class="pivot-result-scroll"><table class="pivot-table"><thead>';
@@ -1694,7 +1806,7 @@
             var v = measures[mi3].aggregator === 'share'
               ? stShareAdjust(bv, mi3)
               : bv;
-            r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT) + '>' + fmtVal(v, measures[mi3]) + '</td>';
+            r += '<td class="pivot-cell pivot-total-cell"' + sf(aRT, sRT, cfStyle(v, measures[mi3], true)) + '>' + fmtVal(v, measures[mi3]) + '</td>';
           } else {
             r += renderCell(rd.values, rd.rows, measures[mi3], aRT, sRT, 'pivot-total-cell', rk, null);
           }
@@ -1798,10 +1910,11 @@
           for (var mi = 0; mi < numMeasures; mi++) {
             var v = hasServerSubtotal ? srvCellVal(colValues[sc], mi) : undefined;
             if (v !== undefined) {
-              r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v, mi), measures[mi]) + '</td>';
+              var vAdj = stShareAdjust(v, mi);
+              r += '<td class="pivot-cell"' + sf(aST, sST, cfStyle(vAdj, measures[mi], true)) + '>' + fmtVal(vAdj, measures[mi]) + '</td>';
             } else {
               var cc = collectCells(colValues[sc]);
-              r += renderCell(cc.cells, cc.rows, measures[mi], aST, sST, null);
+              r += renderCell(cc.cells, cc.rows, measures[mi], aST, sST, 'pivot-total-cell');
             }
           }
         }
@@ -1809,10 +1922,11 @@
         for (var mi2 = 0; mi2 < numMeasures; mi2++) {
           var v2 = hasServerSubtotal ? srvOverallVal(mi2) : undefined;
           if (v2 !== undefined) {
-            r += '<td class="pivot-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v2, mi2), measures[mi2]) + '</td>';
+            var v2Adj = stShareAdjust(v2, mi2);
+            r += '<td class="pivot-cell"' + sf(aST, sST, cfStyle(v2Adj, measures[mi2], true)) + '>' + fmtVal(v2Adj, measures[mi2]) + '</td>';
           } else {
             var allG = collectAll();
-            r += renderCell(allG.cells, allG.rows, measures[mi2], aST, sST, null);
+            r += renderCell(allG.cells, allG.rows, measures[mi2], aST, sST, 'pivot-total-cell');
           }
         }
       }
@@ -1820,7 +1934,8 @@
         for (var mi3 = 0; mi3 < numMeasures; mi3++) {
           var v3 = hasServerSubtotal ? srvOverallVal(mi3) : undefined;
           if (v3 !== undefined) {
-            r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST) + '>' + fmtVal(stShareAdjust(v3, mi3), measures[mi3]) + '</td>';
+            var v3Adj = stShareAdjust(v3, mi3);
+            r += '<td class="pivot-cell pivot-total-cell"' + sf(aST, sST, cfStyle(v3Adj, measures[mi3], true)) + '>' + fmtVal(v3Adj, measures[mi3]) + '</td>';
           } else {
             var allRT = collectAll();
             r += renderCell(allRT.cells, allRT.rows, measures[mi3], aST, sST, 'pivot-total-cell');
@@ -1942,13 +2057,13 @@
             var rowCK = gtMap[colValues[ck_]];
             for (var mi_ = 0; mi_ < numMeasures; mi_++) {
               var v__ = applyShareAdjustment(gtValForMeasure(rowCK, mi_), mi_);
-              h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (v__ !== undefined ? fmtVal(v__, measures[mi_]) : esc(emptyVal)) + '</td>';
+              h += '<td class="pivot-cell"' + sf(aGT, sGT, cfStyle(v__, measures[mi_], true)) + '>' + (v__ !== undefined ? fmtVal(v__, measures[mi_]) : esc(emptyVal)) + '</td>';
             }
           }
         } else {
           for (var mi_no = 0; mi_no < numMeasures; mi_no++) {
             var vNC = applyShareAdjustment(gtValForMeasure(overallRow, mi_no), mi_no);
-            h += '<td class="pivot-cell"' + sf(aGT, sGT) + '>' + (vNC !== undefined ? fmtVal(vNC, measures[mi_no]) : esc(emptyVal)) + '</td>';
+            h += '<td class="pivot-cell"' + sf(aGT, sGT, cfStyle(vNC, measures[mi_no], true)) + '>' + (vNC !== undefined ? fmtVal(vNC, measures[mi_no]) : esc(emptyVal)) + '</td>';
           }
         }
         if (showRowTotal) {
@@ -1985,7 +2100,7 @@
                 gtDisplay = s2;
               }
             }
-            h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT) + '>' + (gtDisplay !== undefined && gtDisplay !== null && gtDisplay !== '' ? fmtVal(gtDisplay, m3) : esc(emptyVal)) + '</td>';
+            h += '<td class="pivot-cell pivot-total-cell"' + sf(aGT, sGT, cfStyle(gtDisplay, m3, true)) + '>' + (gtDisplay !== undefined && gtDisplay !== null && gtDisplay !== '' ? fmtVal(gtDisplay, m3) : esc(emptyVal)) + '</td>';
           }
         }
       } else {
@@ -1994,13 +2109,13 @@
           for (var ck_fe = 0; ck_fe < colValues.length; ck_fe++) {
             var cc = collectColCells(colValues[ck_fe]);
             for (var mi = 0; mi < numMeasures; mi++) {
-              h += renderCell(cc.cells, cc.rows, measures[mi], aGT, sGT, null);
+              h += renderCell(cc.cells, cc.rows, measures[mi], aGT, sGT, 'pivot-total-cell');
             }
           }
         } else {
           var allNoCol = collectAllGT();
           for (var mi2 = 0; mi2 < numMeasures; mi2++) {
-            h += renderCell(allNoCol.cells, allNoCol.rows, measures[mi2], aGT, sGT, null);
+            h += renderCell(allNoCol.cells, allNoCol.rows, measures[mi2], aGT, sGT, 'pivot-total-cell');
           }
         }
         if (showRowTotal) {
@@ -2311,6 +2426,18 @@
       h += buildFormatRow('Grand Total', 'GrandTotal', config);
       h += buildFormatRow('Subtotals', 'Subtotal', config);
 
+      // --- Conditional Formatting ---
+      h += '<div class="pivot-section-label">Conditional Formatting</div>';
+      h += '<div class="pivot-cf-list" data-zone="cf">';
+      var cfList = config.conditionalFormats || [];
+      for (var cfi = 0; cfi < cfList.length; cfi++) {
+        h += buildCFRow(cfList[cfi], cfi, config);
+      }
+      h += '</div>';
+      h += '<div class="pivot-prop-row">';
+      h += '<button class="pivot-add-cf-btn" type="button">+ Add Rule</button>';
+      h += '</div>';
+
       // Page Size
       h += '<div class="pivot-section-label">Pagination</div>';
       h += '<div class="pivot-prop-row">';
@@ -2425,6 +2552,134 @@
       h += '<input type="text" class="pivot-cfg-input pivot-measure-prefix" data-midx="' + idx + '" value="' + esc(measure.prefix || '') + '" placeholder="$"/></div>';
       h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Suffix</label>';
       h += '<input type="text" class="pivot-cfg-input pivot-measure-suffix" data-midx="' + idx + '" value="' + esc(measure.suffix || '') + '" placeholder=""/></div>';
+      h += '</div>'; // end detail
+      h += '</div>';
+      return h;
+    }
+
+    // Conditional Formatting preset palettes (Metabase-inspired)
+    var CF_COLOR_PRESETS = [
+      { name: 'Green',  bg: '#D1FAE5', text: '#065F46' },
+      { name: 'Red',    bg: '#FEE2E2', text: '#991B1B' },
+      { name: 'Yellow', bg: '#FEF3C7', text: '#92400E' },
+      { name: 'Blue',   bg: '#DBEAFE', text: '#1E40AF' },
+      { name: 'Purple', bg: '#EDE9FE', text: '#5B21B6' },
+      { name: 'Pink',   bg: '#FCE7F3', text: '#9D174D' },
+      { name: 'Orange', bg: '#FED7AA', text: '#9A3412' },
+      { name: 'Gray',   bg: '#F3F4F6', text: '#374151' },
+    ];
+    var CF_GRADIENT_PRESETS = [
+      { name: 'White → Green',  min: '#FFFFFF', max: '#22C55E' },
+      { name: 'White → Red',    min: '#FFFFFF', max: '#EF4444' },
+      { name: 'White → Blue',   min: '#FFFFFF', max: '#3B82F6' },
+      { name: 'White → Yellow', min: '#FFFFFF', max: '#EAB308' },
+      { name: 'Red → Green',    min: '#EF4444', max: '#22C55E' },
+      { name: 'Green → Red',    min: '#22C55E', max: '#EF4444' },
+      { name: 'Blue → Red',     min: '#3B82F6', max: '#EF4444' },
+    ];
+
+    // Build a Conditional Formatting rule row (collapsible)
+    function buildCFRow(rule, idx, config) {
+      var measures = config.measures || [];
+      var isGradient = rule.type === 'gradient';
+      var opLabels = { '>': '>', '<': '<', '>=': '≥', '<=': '≤', '=': '=', 'between': 'between' };
+      var mLabel = 'All measures';
+      if (rule.measureId !== 'all') {
+        for (var mi = 0; mi < measures.length; mi++) {
+          if (measures[mi].id === rule.measureId) {
+            var reg = AGG_REGISTRY[measures[mi].aggregator] || { label: measures[mi].aggregator };
+            mLabel = measures[mi].label || (reg.label + (measures[mi].field ? '(' + measures[mi].field + ')' : ''));
+            break;
+          }
+        }
+      }
+      var previewCss = isGradient
+        ? 'background:linear-gradient(90deg,' + esc(rule.minColor || '#fff') + ',' + esc(rule.maxColor || '#22c55e') + ')'
+        : 'background:' + esc(rule.bgColor || '#d4f4dd') + (rule.textColor ? ';color:' + esc(rule.textColor) : '');
+      var summary = isGradient
+        ? 'Gradient · ' + esc(mLabel)
+        : esc(mLabel) + ' ' + esc(opLabels[rule.operator] || rule.operator || '>') + ' ' +
+          esc(rule.value1 !== undefined ? String(rule.value1) : '') +
+          (rule.operator === 'between' ? ' · ' + esc(rule.value2 !== undefined ? String(rule.value2) : '') : '');
+
+      var h = '<div class="pivot-cf-row" data-cfidx="' + idx + '" data-cfid="' + esc(rule.id) + '">';
+      h += '<div class="pivot-cf-summary">';
+      h += '<span class="pivot-cf-preview" style="' + previewCss + '"></span>';
+      h += '<span class="pivot-cf-label">' + summary + '</span>';
+      h += '<span class="pivot-cf-toggle" title="Edit">&#9881;</span>';
+      h += '<span class="pivot-cf-remove" data-cfidx="' + idx + '" title="Remove">&times;</span>';
+      h += '</div>';
+
+      h += '<div class="pivot-cf-detail" style="display:none">';
+      // Type selector
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Type</label>';
+      h += '<select class="pivot-cfg-select pivot-cf-field-type" data-cfidx="' + idx + '">';
+      h += '<option value="threshold"' + (!isGradient ? ' selected' : '') + '>Threshold</option>';
+      h += '<option value="gradient"' + (isGradient ? ' selected' : '') + '>Gradient</option>';
+      h += '</select></div>';
+      // Measure selector
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Measure</label>';
+      h += '<select class="pivot-cfg-select pivot-cf-field-measureId" data-cfidx="' + idx + '">';
+      if (!isGradient) h += '<option value="all"' + (rule.measureId === 'all' ? ' selected' : '') + '>All measures</option>';
+      for (var mi2 = 0; mi2 < measures.length; mi2++) {
+        var mm = measures[mi2];
+        var reg2 = AGG_REGISTRY[mm.aggregator] || { label: mm.aggregator };
+        var label2 = mm.label || (reg2.label + (mm.field ? '(' + mm.field + ')' : ''));
+        h += '<option value="' + esc(mm.id) + '"' + (rule.measureId === mm.id ? ' selected' : '') + '>' + esc(label2) + '</option>';
+      }
+      h += '</select></div>';
+
+      if (!isGradient) {
+        // Operator
+        h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Operator</label>';
+        h += '<select class="pivot-cfg-select pivot-cf-field-operator" data-cfidx="' + idx + '">';
+        var ops = [['>', '> greater than'], ['<', '< less than'], ['>=', '≥ greater or equal'], ['<=', '≤ less or equal'], ['=', '= equals'], ['between', 'between']];
+        for (var oi = 0; oi < ops.length; oi++) {
+          h += '<option value="' + ops[oi][0] + '"' + (rule.operator === ops[oi][0] ? ' selected' : '') + '>' + ops[oi][1] + '</option>';
+        }
+        h += '</select></div>';
+        // Value 1
+        h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Value</label>';
+        h += '<input type="number" class="pivot-cfg-input pivot-cf-field-value1" data-cfidx="' + idx + '" value="' + esc(rule.value1 !== undefined ? rule.value1 : '') + '" step="any"/>';
+        h += '</div>';
+        // Value 2 (between only)
+        h += '<div class="pivot-prop-row pivot-cf-row-value2"' + (rule.operator === 'between' ? '' : ' style="display:none"') + '>';
+        h += '<label class="pivot-prop-label">And</label>';
+        h += '<input type="number" class="pivot-cfg-input pivot-cf-field-value2" data-cfidx="' + idx + '" value="' + esc(rule.value2 !== undefined ? rule.value2 : '') + '" step="any"/>';
+        h += '</div>';
+        // Color preset swatches (bg + text)
+        h += '<div class="pivot-prop-row pivot-prop-row-stack"><label class="pivot-prop-label">Color</label>';
+        h += '<div class="pivot-cf-swatches" data-cfidx="' + idx + '">';
+        var curBg = (rule.bgColor || '#D1FAE5').toUpperCase();
+        for (var pi = 0; pi < CF_COLOR_PRESETS.length; pi++) {
+          var p = CF_COLOR_PRESETS[pi];
+          var active = p.bg.toUpperCase() === curBg;
+          h += '<button type="button" class="pivot-cf-swatch' + (active ? ' active' : '') +
+               '" title="' + esc(p.name) + '" data-bg="' + esc(p.bg) + '" data-text="' + esc(p.text) +
+               '" style="background:' + esc(p.bg) + ';color:' + esc(p.text) + '">' + esc(p.name[0]) + '</button>';
+        }
+        h += '</div></div>';
+      } else {
+        // Gradient preset swatches
+        h += '<div class="pivot-prop-row pivot-prop-row-stack"><label class="pivot-prop-label">Gradient</label>';
+        h += '<div class="pivot-cf-gradients" data-cfidx="' + idx + '">';
+        var curMin = (rule.minColor || '#FFFFFF').toUpperCase();
+        var curMax = (rule.maxColor || '#22C55E').toUpperCase();
+        for (var gi = 0; gi < CF_GRADIENT_PRESETS.length; gi++) {
+          var g = CF_GRADIENT_PRESETS[gi];
+          var gActive = g.min.toUpperCase() === curMin && g.max.toUpperCase() === curMax;
+          h += '<button type="button" class="pivot-cf-gradient-swatch' + (gActive ? ' active' : '') +
+               '" title="' + esc(g.name) + '" data-min="' + esc(g.min) + '" data-max="' + esc(g.max) +
+               '" style="background:linear-gradient(90deg,' + esc(g.min) + ',' + esc(g.max) + ')"></button>';
+        }
+        h += '</div></div>';
+      }
+      // Apply to totals
+      h += '<div class="pivot-prop-row"><label class="pivot-prop-label">Apply to totals</label>';
+      h += '<label class="pivot-toggle-switch">';
+      h += '<input type="checkbox" class="pivot-cf-field-applyToTotals" data-cfidx="' + idx + '"' + (rule.applyToTotals ? ' checked' : '') + '/>';
+      h += '<span class="pivot-toggle-slider"></span>';
+      h += '</label></div>';
       h += '</div>'; // end detail
       h += '</div>';
       return h;
@@ -2561,6 +2816,42 @@
       config.valueField = newMeasures[0].field || '';
       config.aggregator = newMeasures[0].aggregator || 'count';
 
+      // --- Conditional Formatting rules ---
+      var baseCF = (cached && cached.conditionalFormats) || [];
+      var cfRowsDom = section.querySelectorAll('.pivot-cf-row');
+      var newCF = [];
+      for (var ci = 0; ci < cfRowsDom.length; ci++) {
+        var cr = cfRowsDom[ci];
+        var cidx = parseInt(cr.getAttribute('data-cfidx'), 10);
+        var cbase = baseCF[cidx] || { id: cr.getAttribute('data-cfid') || ('cf_' + Math.random().toString(36).slice(2, 10)) };
+        var typeEl = cr.querySelector('.pivot-cf-field-type');
+        var mIdEl = cr.querySelector('.pivot-cf-field-measureId');
+        var opEl = cr.querySelector('.pivot-cf-field-operator');
+        var v1El = cr.querySelector('.pivot-cf-field-value1');
+        var v2El = cr.querySelector('.pivot-cf-field-value2');
+        var activeSwatch = cr.querySelector('.pivot-cf-swatch.active');
+        var activeGrad = cr.querySelector('.pivot-cf-gradient-swatch.active');
+        var totEl = cr.querySelector('.pivot-cf-field-applyToTotals');
+        var rule = {
+          id: cbase.id,
+          type: typeEl ? typeEl.value : (cbase.type || 'threshold'),
+          measureId: mIdEl ? mIdEl.value : (cbase.measureId || 'all'),
+          applyToTotals: totEl ? totEl.checked : !!cbase.applyToTotals,
+        };
+        if (rule.type === 'threshold') {
+          rule.operator = opEl ? opEl.value : (cbase.operator || '>');
+          rule.value1 = v1El && v1El.value !== '' ? parseFloat(v1El.value) : (cbase.value1 !== undefined ? cbase.value1 : 0);
+          if (rule.operator === 'between') rule.value2 = v2El && v2El.value !== '' ? parseFloat(v2El.value) : (cbase.value2 !== undefined ? cbase.value2 : 0);
+          rule.bgColor = activeSwatch ? activeSwatch.getAttribute('data-bg') : (cbase.bgColor || '#D1FAE5');
+          rule.textColor = activeSwatch ? activeSwatch.getAttribute('data-text') : (cbase.textColor || '#065F46');
+        } else {
+          rule.minColor = activeGrad ? activeGrad.getAttribute('data-min') : (cbase.minColor || '#FFFFFF');
+          rule.maxColor = activeGrad ? activeGrad.getAttribute('data-max') : (cbase.maxColor || '#22C55E');
+        }
+        newCF.push(rule);
+      }
+      config.conditionalFormats = newCF.length ? newCF : baseCF;
+
       var showTitleCb = section.querySelector('.pivot-cfg-showTitle');
       if (showTitleCb) config.showTitle = showTitleCb.checked;
 
@@ -2648,6 +2939,18 @@
       var h = '';
       for (var i = 0; i < config.measures.length; i++) {
         h += buildMeasureRow(config.measures[i], i, config);
+      }
+      list.innerHTML = h;
+    }
+
+    function rebuildCFUI(section, config) {
+      var list = section.querySelector('.pivot-cf-list');
+      if (!list) return;
+      normalizeConfig(config);
+      var h = '';
+      var arr = config.conditionalFormats || [];
+      for (var i = 0; i < arr.length; i++) {
+        h += buildCFRow(arr[i], i, config);
       }
       list.innerHTML = h;
     }
@@ -2763,6 +3066,89 @@
           setConfig(widgetName, cfg2);
           rebuildMeasuresUI(section, cfg2);
           updatePreview(widgetName, cfg2);
+        }
+
+        // ---- Conditional Formatting actions ----
+        var cfTgl = e.target.closest('.pivot-cf-toggle, .pivot-cf-summary');
+        if (cfTgl) {
+          var cr = cfTgl.closest('.pivot-cf-row');
+          if (cr && !e.target.closest('.pivot-cf-remove')) {
+            var cd = cr.querySelector('.pivot-cf-detail');
+            if (cd) cd.style.display = cd.style.display === 'none' ? '' : 'none';
+            e.stopPropagation();
+          }
+        }
+        var cfRm = e.target.closest('.pivot-cf-remove');
+        if (cfRm) {
+          e.stopPropagation();
+          var cIdx = parseInt(cfRm.getAttribute('data-cfidx'), 10);
+          var cfgCF = getConfig(widgetName);
+          cfgCF.conditionalFormats = cfgCF.conditionalFormats || [];
+          cfgCF.conditionalFormats.splice(cIdx, 1);
+          setConfig(widgetName, cfgCF);
+          rebuildCFUI(section, cfgCF);
+          updatePreview(widgetName, cfgCF);
+        }
+        var cfAdd = e.target.closest('.pivot-add-cf-btn');
+        if (cfAdd) {
+          e.stopPropagation();
+          var cfgCF2 = getConfig(widgetName);
+          cfgCF2.conditionalFormats = (cfgCF2.conditionalFormats || []).concat([{
+            id: 'cf_' + Math.random().toString(36).slice(2, 10),
+            type: 'threshold',
+            measureId: 'all',
+            operator: '>',
+            value1: 0,
+            bgColor: '#D1FAE5',
+            textColor: '#065F46',
+            applyToTotals: false,
+          }]);
+          setConfig(widgetName, cfgCF2);
+          rebuildCFUI(section, cfgCF2);
+          updatePreview(widgetName, cfgCF2);
+        }
+
+        // CF color swatch click → set active + save
+        var swatch = e.target.closest('.pivot-cf-swatch, .pivot-cf-gradient-swatch');
+        if (swatch) {
+          e.stopPropagation();
+          var container = swatch.parentElement;
+          var siblings = container.querySelectorAll(swatch.classList.contains('pivot-cf-swatch') ? '.pivot-cf-swatch' : '.pivot-cf-gradient-swatch');
+          for (var ss = 0; ss < siblings.length; ss++) siblings[ss].classList.remove('active');
+          swatch.classList.add('active');
+          var cfgSw = readConfigFromDOM(section);
+          setConfig(widgetName, cfgSw);
+          rebuildCFUI(section, cfgSw);
+          updatePreview(widgetName, cfgSw);
+        }
+      });
+
+      // CF: type/operator/measure selector changes → re-read + rebuild this row
+      section.addEventListener('change', function (e) {
+        var el = e.target;
+        if (!el.classList) return;
+        if (el.classList.contains('pivot-cf-field-type')
+            || el.classList.contains('pivot-cf-field-measureId')
+            || el.classList.contains('pivot-cf-field-operator')
+            || el.classList.contains('pivot-cf-field-applyToTotals')) {
+          // Read, apply, rebuild to reflect type/operator changes
+          var cfg = readConfigFromDOM(section);
+          setConfig(widgetName, cfg);
+          rebuildCFUI(section, cfg);
+          updatePreview(widgetName, cfg);
+        }
+      });
+      // CF: value inputs (debounced)
+      section.addEventListener('input', function (e) {
+        var el = e.target;
+        if (!el.classList) return;
+        if (el.classList.contains('pivot-cf-field-value1') || el.classList.contains('pivot-cf-field-value2')) {
+          clearTimeout(_debounceTimer);
+          _debounceTimer = setTimeout(function () {
+            var cfg = readConfigFromDOM(section);
+            setConfig(widgetName, cfg);
+            updatePreview(widgetName, cfg);
+          }, 300);
         }
       });
 
