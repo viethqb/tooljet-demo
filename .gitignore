@@ -1,2 +1,6 @@
-postgres_datanode_modules/
+postgres_data/
+node_modules/
 .claude/
+.venv/
+tests/e2e/_screenshots/
+tests/e2e/__pycache__/
